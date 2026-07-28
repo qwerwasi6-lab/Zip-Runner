@@ -1848,8 +1848,24 @@
             // is not enough for GLTFLoader/DRACOLoader and results in the runner's HTML
             // being downloaded and parsed as a GLB/JSON file.
             function buildAssetResolverShim(assetMap, baseDir) {
+                // A zip is commonly wrapped in a top-level folder (Game/index.html,
+                // Game/assets/model.glb), while srcdoc resolves "assets/model.glb"
+                // against the runner page URL. Add web-root aliases relative to the
+                // selected HTML entry so that the inherited runner path is irrelevant.
+                const aliases = Object.assign({}, assetMap);
+                const normalizedBaseDir = (baseDir || '').replace(/^\/+/, '').replace(/\/+$/, '');
+                if (normalizedBaseDir) {
+                    const prefix = normalizedBaseDir + '/';
+                    Object.keys(assetMap).forEach(path => {
+                        if (path.startsWith(prefix)) {
+                            const webPath = path.slice(prefix.length);
+                            if (webPath && aliases[webPath] === undefined) aliases[webPath] = assetMap[path];
+                        }
+                    });
+                }
+
                 // Zip filenames are untrusted and this JSON is placed in a script element.
-                const assetJson = JSON.stringify(assetMap).replace(/<\/script/gi, '<\\/script');
+                const assetJson = JSON.stringify(aliases).replace(/<\/script/gi, '<\\/script');
                 return `
 <script>
 (function(){
@@ -1919,7 +1935,15 @@
               }
               var clean = url.split('#')[0].split('?')[0];
               var asset = findAsset(clean, wasAbsolute || clean.startsWith('/'));
-              return asset || String(value);
+              if (asset) return asset;
+              if (/\\.(?:glb|gltf|bin)$/i.test(clean)) {
+                var knownModels = Object.keys(ASSETS).filter(function(path) {
+                  return /\\.(?:glb|gltf|bin)$/i.test(path);
+                });
+                console.warn('[Zip Runner] Model request did not match a file in the zip:',
+                  String(value), 'Known model files:', knownModels.length ? knownModels.join(', ') : '(none)');
+              }
+              return String(value);
             } catch (e) { return value; }
           }
 
