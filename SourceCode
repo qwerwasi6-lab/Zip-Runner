@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Zip Game Runner</title>
+    <title>Zip Game Runner V0.0.7</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script type="module">
         import * as esbuild from "https://unpkg.com/esbuild-wasm@0.23.0/esm/browser.js";
@@ -85,6 +85,13 @@
                 border-radius: 50%;
                 background: var(--accent);
                 box-shadow: 0 0 8px var(--accent);
+            }
+
+            .brand .version {
+                color: var(--text-dim);
+                font-size: 11px;
+                font-weight: 500;
+                letter-spacing: 0;
             }
 
         .file-info {
@@ -788,7 +795,7 @@
 <body>
 
     <div class="topbar">
-        <div class="brand"><span class="dot"></span>ZIP RUNNER</div>
+        <div class="brand"><span class="dot"></span>ZIP RUNNER <span class="version">V0.0.7</span></div>
         <div class="file-info" id="fileInfo">No zip loaded</div>
         <select class="entry-picker" id="entryPicker" style="display:none;"></select>
         <button class="btn" id="reloadBtn" style="display:none;">Reload</button>
@@ -2565,9 +2572,10 @@
                 // indexedDB to work at all, and to persist across reloads (without it,
                 // the frame gets a fresh unique/opaque origin every load and storage is
                 // blocked outright).
-                // allow-fullscreen: required for the Fullscreen API to work from inside
-                // the iframe.
-                iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-pointer-lock allow-forms allow-modals allow-popups allow-fullscreen');
+                // Fullscreen is granted through the iframe permission attribute below;
+                // "allow-fullscreen" is not a valid sandbox token.
+                iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-pointer-lock allow-forms allow-modals allow-popups');
+                iframe.setAttribute('allow', 'fullscreen');
                 iframe.setAttribute('allowfullscreen', 'true');
                 iframe.srcdoc = finalHtml;
                 iframe.addEventListener('load', () => {
@@ -2809,6 +2817,18 @@
                             return dataUri ? `${quote}${dataUri}${quote}` : match;
                         });
 
+                        // GLTFLoader ultimately uses fetch(), but browser/srcdoc URL
+                        // resolution can turn a local model path into the runner page URL
+                        // before a fetch shim sees it. Replace literal standalone GLB paths
+                        // in game code directly, so the loader receives the archive bytes
+                        // and can never accidentally parse the runner's <!DOCTYPE> as JSON.
+                        rewritten = rewritten.replace(/(["'])([^"']+\.glb(?:[?#][^"']*)?)\1/gi, (match, quote, spec) => {
+                            const resolvedPath = resolveModuleSpecifierPath(jsDir, spec);
+                            if (!resolvedPath) return match;
+                            const dataUri = blobUrlMap[resolvedPath];
+                            return dataUri ? `${quote}${dataUri}${quote}` : match;
+                        });
+
                         return rewritten;
                     }
 
@@ -2881,7 +2901,7 @@
                     html = html.replace(/(<script\b[^>]*>)([\s\S]*?)(<\/script>)/gi, (match, open, code, close) => {
                         if (/\ssrc\s*=/i.test(open)) return match; // handled above
                         if (/\stype\s*=\s*["'](?:application\/json|application\/ld\+json|importmap)["']/i.test(open)) return match;
-                        return open + rewriteJsImports(entryDir.replace(/\/$/, ''), code) + close;
+                        return open + rewriteJsImports(entryPath, code) + close;
                     });
 
                     // Build an asset resolver map (relative to entryDir) for a runtime fetch/XHR shim,
@@ -2909,8 +2929,10 @@
                     // giving it a stable origin so localStorage/indexedDB work and persist
                     // across reloads. Without it the frame gets a fresh unique/opaque
                     // origin every load and storage APIs are blocked outright.
-                    // allow-fullscreen: required for the Fullscreen API inside the iframe.
-                    iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-pointer-lock allow-forms allow-modals allow-popups allow-fullscreen');
+                    // Fullscreen is granted through the iframe permission attribute below;
+                    // "allow-fullscreen" is not a valid sandbox token.
+                    iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-pointer-lock allow-forms allow-modals allow-popups');
+                    iframe.setAttribute('allow', 'fullscreen');
                     iframe.setAttribute('allowfullscreen', 'true');
                     iframe.srcdoc = html;
 
@@ -2951,6 +2973,5 @@
             renderSidebar();
         })();
     </script>
-    <script>(function () { function c() { var b = a.contentDocument || (a.contentWindow && a.contentWindow.document); if (b) { var d = b.createElement('script'); d.innerHTML = "window.__CF$cv$params={r:'a21a8880bfefd0f6',t:'MTc4NTE0MzY1OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);"; b.getElementsByTagName('head')[0].appendChild(d) } } if (document.body) { var a = document.createElement('iframe'); a.height = 1; a.width = 1; a.style.position = 'absolute'; a.style.top = 0; a.style.left = 0; a.style.border = 'none'; a.style.visibility = 'hidden'; document.body.appendChild(a); if ('loading' !== document.readyState) c(); else if (window.addEventListener) document.addEventListener('DOMContentLoaded', c); else { var e = document.onreadystatechange || function () { }; document.onreadystatechange = function (b) { e(b); 'loading' !== document.readyState && (document.onreadystatechange = e, c()) } } } })();</script>
 </body>
 </html>
