@@ -2768,13 +2768,25 @@
                     // ever reaches the browser -- recursively, since imported files can
                     // themselves import further relative files.
                     //
-                    // Bare specifiers (e.g. "import x from 'libsodium'") are left alone:
-                    // those are handled by the page's own <script type="importmap"> (or
-                    // will simply fail the same way they would outside this runner if
-                    // there's no import map, which is correct/expected behavior to preserve).
+                    // Bare package specifiers (e.g. "import sodium from 'libsodium'")
+                    // cannot resolve from srcdoc/data: modules by themselves. Collect them
+                    // across the complete local module graph and generate a CDN import map
+                    // before any game module executes.
+                    const bareImportSpecifiers = new Set();
                     const jsDataUriCache = {}; // original blob-map path -> rewritten data: URI, avoids re-rewriting shared imports
                     function rewriteJsImports(jsPath, jsText) {
                         const jsDir = jsPath.includes('/') ? jsPath.slice(0, jsPath.lastIndexOf('/')) : '';
+
+                        function rememberBareSpecifier(spec) {
+                            if (!spec || spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('#') ||
+                                /^(?:[a-z][a-z0-9+.-]*:|data:|blob:)/i.test(spec)) return;
+                            bareImportSpecifiers.add(spec);
+                        }
+                        let bareMatch;
+                        const staticBareRe = /\b(?:import|export)\s*(?:[^'";]*?\bfrom\s*)?["']([^"']+)["']/g;
+                        const dynamicBareRe = /\bimport\s*\(\s*["']([^"']+)["']/g;
+                        while ((bareMatch = staticBareRe.exec(jsText))) rememberBareSpecifier(bareMatch[1]);
+                        while ((bareMatch = dynamicBareRe.exec(jsText))) rememberBareSpecifier(bareMatch[1]);
 
                         // First pass: structured static imports/exports and simple dynamic
                         // import('./x.js') calls.
@@ -2904,12 +2916,46 @@
                         return open + rewriteJsImports(entryPath, code) + close;
                     });
 
+                    // Supply unresolved bare package imports through esm.sh. If the game
+                    // already has an import map, merge only missing entries into it so its
+                    // explicit package/version choices continue to win.
+                    let generatedImportMapTag = '';
+                    if (bareImportSpecifiers.size) {
+                        const cdnImports = {};
+                        bareImportSpecifiers.forEach(spec => {
+                            cdnImports[spec] = 'https://esm.sh/' + spec;
+                        });
+
+                        const existingImportMapRe = /(<script\b[^>]*\btype\s*=\s*["']importmap["'][^>]*>)([\s\S]*?)(<\/script>)/i;
+                        const existingImportMapMatch = html.match(existingImportMapRe);
+                        let mergedExistingMap = false;
+                        if (existingImportMapMatch) {
+                            try {
+                                const parsedMap = JSON.parse(existingImportMapMatch[2]);
+                                parsedMap.imports = parsedMap.imports || {};
+                                Object.keys(cdnImports).forEach(spec => {
+                                    if (parsedMap.imports[spec] === undefined) parsedMap.imports[spec] = cdnImports[spec];
+                                });
+                                const safeJson = JSON.stringify(parsedMap).replace(/<\/script/gi, '<\\/script');
+                                html = html.replace(existingImportMapRe, existingImportMapMatch[1] + safeJson + existingImportMapMatch[3]);
+                                mergedExistingMap = true;
+                            } catch (e) {
+                                logToConsole('parent', 'warn', ['The game has an invalid import map; adding a separate map for: ' + Array.from(bareImportSpecifiers).join(', ')]);
+                            }
+                        }
+                        if (!mergedExistingMap) {
+                            const safeJson = JSON.stringify({ imports: cdnImports }).replace(/<\/script/gi, '<\\/script');
+                            generatedImportMapTag = '<script type="importmap">' + safeJson + '<\/script>';
+                        }
+                        logToConsole('parent', 'info', ['Resolved package imports through esm.sh: ' + Array.from(bareImportSpecifiers).join(', ')]);
+                    }
+
                     // Build an asset resolver map (relative to entryDir) for a runtime fetch/XHR shim,
                     // so scripts that fetch() JSON/images by relative path still work.
                     const assetMapForShim = {};
                     Object.keys(blobUrlMap).forEach(p => { assetMapForShim[p] = blobUrlMap[p]; });
 
-                    const shim = buildAssetResolverShim(assetMapForShim, entryDir) +
+                    const shim = generatedImportMapTag + buildAssetResolverShim(assetMapForShim, entryDir) +
                         debugShim + buildSettingsShim(settings.gpu, settings.toggles);
 
                     if (/<head[^>]*>/i.test(html)) {
