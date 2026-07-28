@@ -1,0 +1,2882 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zip Game Runner</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script type="module">
+        import * as esbuild from "https://unpkg.com/esbuild-wasm@0.23.0/esm/browser.js";
+        window.__esbuild = esbuild;
+        // worker:false runs esbuild on the main thread instead of spinning up a
+        // Web Worker via a blob: URL. Some sandboxed/embedded environments block
+        // blob-based workers via Content-Security-Policy, which causes esbuild's
+        // worker script to fail to load (net::ERR_FAILED) and leaves
+        // __esbuildInitPromise permanently unresolved. Main-thread mode avoids that,
+        // at the cost of blocking the UI thread briefly during a build.
+        window.__esbuildInitPromise = esbuild.initialize({
+            wasmURL: "https://unpkg.com/esbuild-wasm@0.23.0/esbuild.wasm",
+            worker: false
+        }).catch(err => {
+            console.error('esbuild initialize failed:', err);
+            window.__esbuildInitError = err;
+            throw err;
+        });
+    </script>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --panel: #151b23;
+            --panel-border: #2a323c;
+            --accent: #5ee6a8;
+            --accent-dim: #2f8a5e;
+            --text: #e6edf3;
+            --text-dim: #8b98a5;
+            --danger: #ff6b6b;
+            --mono: "SF Mono", "JetBrains Mono", "Cascadia Code", ui-monospace, Consolas, monospace;
+            --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            background: var(--bg);
+            color: var(--text);
+            font-family: var(--sans);
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Top bar */
+        .topbar {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 10px 16px;
+            background: var(--panel);
+            border-bottom: 1px solid var(--panel-border);
+            flex-shrink: 0;
+            flex-wrap: wrap;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-family: var(--mono);
+            font-weight: 700;
+            letter-spacing: 0.02em;
+            color: var(--accent);
+            font-size: 14px;
+            white-space: nowrap;
+        }
+
+            .brand .dot {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: var(--accent);
+                box-shadow: 0 0 8px var(--accent);
+            }
+
+        .file-info {
+            font-family: var(--mono);
+            font-size: 12px;
+            color: var(--text-dim);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            flex: 1;
+            min-width: 80px;
+        }
+
+            .file-info b {
+                color: var(--text);
+                font-weight: 600;
+            }
+
+        .btn {
+            appearance: none;
+            border: 1px solid var(--panel-border);
+            background: #1c232c;
+            color: var(--text);
+            font-family: var(--sans);
+            font-size: 13px;
+            font-weight: 500;
+            padding: 7px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: border-color .15s ease, background .15s ease;
+        }
+
+            .btn:hover {
+                border-color: var(--accent-dim);
+                background: #222b35;
+            }
+
+            .btn:active {
+                transform: translateY(1px);
+            }
+
+        .btn-primary {
+            background: var(--accent);
+            color: #06301d;
+            border-color: var(--accent);
+            font-weight: 700;
+        }
+
+            .btn-primary:hover {
+                background: #7bf0bd;
+                border-color: #7bf0bd;
+            }
+
+        .btn:disabled {
+            opacity: .4;
+            cursor: not-allowed;
+        }
+
+        select.entry-picker {
+            font-family: var(--mono);
+            font-size: 12px;
+            background: #1c232c;
+            color: var(--text);
+            border: 1px solid var(--panel-border);
+            border-radius: 6px;
+            padding: 6px 8px;
+            max-width: 220px;
+        }
+
+        input[type=file] {
+            display: none;
+        }
+
+        /* Main stage */
+        .stage {
+            flex: 1;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 0;
+            background: #000;
+            overflow: hidden;
+        }
+
+        /* Wraps the game iframe. The iframe itself is always sized to the TRUE
+        chosen resolution in real pixels (so the game's internal viewport,
+        canvas sizing, window.innerWidth/innerHeight etc. all see the actual
+        resolution) -- this wrapper is what gets visually scaled up/down via
+        a CSS transform to fit the available space, so "how big it looks on
+        screen" is completely decoupled from "what resolution the game thinks
+        it's rendering at". Fullscreen targets this wrapper (not the iframe),
+        since the transform-scale approach needs to keep working the same way
+        whether we're in a small stage panel or filling the whole screen. */
+        .game-frame-wrapper {
+            position: relative;
+            transform-origin: center center;
+            flex-shrink: 0;
+        }
+
+            .game-frame-wrapper:fullscreen {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: #000;
+                width: 100vw;
+                height: 100vh;
+            }
+
+            .game-frame-wrapper:-webkit-full-screen {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: #000;
+                width: 100vw;
+                height: 100vh;
+            }
+
+        /* Game area: everything to the right of the sidebar */
+        .game-area {
+            flex: 1;
+            position: relative;
+            display: flex;
+            min-height: 0;
+            min-width: 0;
+        }
+
+        /* Sidebar: game library */
+        .sidebar {
+            width: 240px;
+            flex-shrink: 0;
+            background: var(--panel);
+            border-right: 1px solid var(--panel-border);
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+
+        .sidebar-header {
+            padding: 12px 12px 8px;
+            font-family: var(--mono);
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: .04em;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            flex-shrink: 0;
+        }
+
+        .sidebar-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0 8px 8px;
+        }
+
+        .sidebar-empty {
+            padding: 12px 8px;
+            font-size: 12px;
+            color: #5b6672;
+            line-height: 1.5;
+        }
+
+        .game-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 8px;
+            border-radius: 7px;
+            cursor: pointer;
+            margin-bottom: 2px;
+            border: 1px solid transparent;
+        }
+
+            .game-item:hover {
+                background: #1c232c;
+            }
+
+            .game-item.active {
+                background: #16301f;
+                border-color: var(--accent-dim);
+            }
+
+        .game-item-icon {
+            width: 28px;
+            height: 28px;
+            flex-shrink: 0;
+            border-radius: 6px;
+            background: #1c232c;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--accent-dim);
+        }
+
+        .game-item-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .game-item-name {
+            font-size: 12.5px;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+            .game-item-name[contenteditable="true"] {
+                outline: 1px solid var(--accent);
+                border-radius: 3px;
+                padding: 0 3px;
+                background: #0d1117;
+                white-space: normal;
+                overflow: visible;
+            }
+
+        .game-item-meta {
+            font-size: 10px;
+            color: #5b6672;
+            font-family: var(--mono);
+        }
+
+        .game-item-actions {
+            display: flex;
+            gap: 2px;
+            opacity: 0;
+            flex-shrink: 0;
+        }
+
+        .game-item:hover .game-item-actions {
+            opacity: 1;
+        }
+
+        .game-item-actions button {
+            width: 22px;
+            height: 22px;
+            border: none;
+            background: transparent;
+            color: var(--text-dim);
+            border-radius: 5px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+            .game-item-actions button:hover {
+                background: #2a323c;
+                color: var(--text);
+            }
+
+            .game-item-actions button.danger:hover {
+                background: #4a1f1f;
+                color: var(--danger);
+            }
+
+        /* Drop zone / landing */
+        .dropzone {
+            flex: 1;
+            align-self: stretch;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px;
+        }
+
+            .dropzone.dragover .dz-card {
+                border-color: var(--accent);
+                background: #10241a;
+            }
+
+        .dz-card {
+            width: min(560px, 100%);
+            border: 2px dashed var(--panel-border);
+            border-radius: 14px;
+            padding: 48px 32px;
+            text-align: center;
+            transition: border-color .15s ease, background .15s ease;
+        }
+
+        .dz-icon {
+            width: 56px;
+            height: 56px;
+            margin: 0 auto 18px;
+            color: var(--accent-dim);
+        }
+
+        .dz-card h1 {
+            font-size: 19px;
+            margin: 0 0 8px;
+            font-weight: 700;
+        }
+
+        .dz-card p {
+            color: var(--text-dim);
+            font-size: 13.5px;
+            line-height: 1.6;
+            margin: 0 0 22px;
+        }
+
+        .dz-card code {
+            font-family: var(--mono);
+            background: #1c232c;
+            padding: 1px 5px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .dz-hint {
+            margin-top: 18px;
+            font-size: 11.5px;
+            color: #5b6672;
+        }
+
+        /* Base .game-frame sizing is defined by ".stage iframe.game-frame" further
+        down (kept together with the letterbox/resolution logic notes). */
+
+        .status-bar {
+            padding: 8px 16px;
+            background: var(--panel);
+            border-top: 1px solid var(--panel-border);
+            font-family: var(--mono);
+            font-size: 11.5px;
+            color: var(--text-dim);
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+
+            .status-bar.error {
+                color: var(--danger);
+            }
+
+            .status-bar .right {
+                color: #5b6672;
+            }
+
+        .spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid var(--panel-border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin .7s linear infinite;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 6px;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .error-panel {
+            flex: 1;
+            align-self: stretch;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px;
+        }
+
+        .error-card {
+            max-width: 520px;
+            text-align: center;
+        }
+
+            .error-card h2 {
+                color: var(--danger);
+                font-size: 17px;
+                margin: 0 0 10px;
+            }
+
+            .error-card p {
+                color: var(--text-dim);
+                font-size: 13.5px;
+                line-height: 1.6;
+            }
+
+        /* Debug console drawer */
+        .debug-console {
+            display: none;
+            flex-direction: column;
+            position: fixed;
+            right: 0;
+            bottom: 0;
+            top: 0;
+            width: min(480px, 100%);
+            background: #0a0e13;
+            border-left: 1px solid var(--panel-border);
+            box-shadow: -8px 0 24px rgba(0,0,0,.4);
+            z-index: 1000;
+        }
+
+            .debug-console.open {
+                display: flex;
+            }
+
+        .debug-console-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 14px;
+            background: var(--panel);
+            border-bottom: 1px solid var(--panel-border);
+            font-family: var(--mono);
+            font-weight: 700;
+            font-size: 13px;
+            flex-shrink: 0;
+        }
+
+        .debug-console-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+            font-family: var(--mono);
+            font-size: 11.5px;
+            line-height: 1.5;
+        }
+
+        .console-entry {
+            padding: 6px 8px;
+            border-bottom: 1px solid #1a2028;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+            .console-entry .meta {
+                color: #5b6672;
+                font-size: 10px;
+                margin-bottom: 2px;
+                display: flex;
+                gap: 6px;
+            }
+
+            .console-entry.level-error {
+                color: var(--danger);
+            }
+
+            .console-entry.level-warn {
+                color: #e6c15e;
+            }
+
+            .console-entry.level-info {
+                color: var(--text-dim);
+            }
+
+            .console-entry.level-log {
+                color: var(--text);
+            }
+
+            .console-entry .tag {
+                font-weight: 700;
+                padding: 0 5px;
+                border-radius: 3px;
+                font-size: 9.5px;
+                letter-spacing: .03em;
+            }
+
+            .console-entry.source-parent .tag {
+                background: #2a3f52;
+                color: #7ec8ff;
+            }
+
+            .console-entry.source-iframe .tag {
+                background: #3a2f52;
+                color: #c39bff;
+            }
+
+            .console-entry.source-resource .tag {
+                background: #4a2a2a;
+                color: #ff9b9b;
+            }
+
+        @media (max-width: 720px) {
+            .sidebar {
+                width: 160px;
+            }
+
+            .game-item-meta {
+                display: none;
+            }
+
+            .dock {
+                bottom: 8px;
+            }
+        }
+
+        /* Game iframe sizing: .stage itself is the letterbox container (centers
+        content, black background), so the iframe just needs flex:none so its
+        width/height (set by applyResolution()) aren't overridden by flex stretch. */
+        .stage iframe.game-frame {
+            border: none;
+            background: #000;
+            display: block;
+        }
+
+        .fps-overlay {
+            position: absolute;
+            top: 8px;
+            left: 8px;
+            font-family: var(--mono);
+            font-size: 11px;
+            background: rgba(0,0,0,.55);
+            color: var(--accent);
+            padding: 3px 7px;
+            border-radius: 5px;
+            pointer-events: none;
+            z-index: 5;
+        }
+
+        /* Bottom dock */
+        .dock {
+            position: fixed;
+            left: 50%;
+            bottom: 16px;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 4px;
+            background: rgba(21, 27, 35, .92);
+            backdrop-filter: blur(8px);
+            border: 1px solid var(--panel-border);
+            border-radius: 14px;
+            padding: 6px;
+            box-shadow: 0 8px 24px rgba(0,0,0,.35);
+            z-index: 900;
+        }
+
+        .dock-btn {
+            width: 40px;
+            height: 40px;
+            border: none;
+            background: transparent;
+            color: var(--text-dim);
+            border-radius: 9px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background .15s ease, color .15s ease;
+        }
+
+            .dock-btn svg {
+                width: 20px;
+                height: 20px;
+            }
+
+            .dock-btn:hover {
+                background: #222b35;
+                color: var(--text);
+            }
+
+            .dock-btn.active {
+                background: var(--accent);
+                color: #06301d;
+            }
+
+        /* Dock popover panels */
+        .dock-panel {
+            display: none;
+            position: fixed;
+            left: 50%;
+            bottom: 68px;
+            transform: translateX(-50%);
+            width: min(340px, calc(100vw - 32px));
+            background: var(--panel);
+            border: 1px solid var(--panel-border);
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,.4);
+            z-index: 901;
+            padding: 14px;
+        }
+
+            .dock-panel.open {
+                display: block;
+            }
+
+            .dock-panel h3 {
+                margin: 0 0 12px;
+                font-size: 13px;
+                font-weight: 700;
+                font-family: var(--mono);
+                color: var(--accent);
+            }
+
+        .panel-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 7px 0;
+            font-size: 13px;
+            gap: 12px;
+        }
+
+            .panel-row + .panel-row {
+                border-top: 1px solid #1e252d;
+            }
+
+            .panel-row label {
+                flex: 1;
+                cursor: pointer;
+            }
+
+        .panel-hint {
+            font-size: 11px;
+            color: #5b6672;
+            margin-top: 2px;
+            line-height: 1.4;
+        }
+
+        .panel-select {
+            background: #1c232c;
+            color: var(--text);
+            border: 1px solid var(--panel-border);
+            border-radius: 6px;
+            padding: 5px 8px;
+            font-family: var(--mono);
+            font-size: 12px;
+        }
+
+        .panel-note {
+            font-size: 11px;
+            color: var(--text-dim);
+            background: #1c232c;
+            border-radius: 7px;
+            padding: 8px 10px;
+            margin-top: 10px;
+            line-height: 1.5;
+        }
+
+        .custom-res-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 8px;
+        }
+
+            .custom-res-row input {
+                width: 64px;
+                background: #1c232c;
+                color: var(--text);
+                border: 1px solid var(--panel-border);
+                border-radius: 6px;
+                padding: 5px 6px;
+                font-family: var(--mono);
+                font-size: 12px;
+            }
+
+        /* Toggle switch */
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 36px;
+            height: 20px;
+            flex-shrink: 0;
+            cursor: pointer;
+        }
+
+            .switch input {
+                opacity: 0;
+                width: 0;
+                height: 0;
+                position: absolute;
+            }
+
+            .switch .slider {
+                position: absolute;
+                inset: 0;
+                background: #2a323c;
+                border-radius: 20px;
+                cursor: pointer;
+                transition: background .15s ease;
+            }
+
+                .switch .slider::before {
+                    content: '';
+                    position: absolute;
+                    width: 16px;
+                    height: 16px;
+                    left: 2px;
+                    top: 2px;
+                    background: #e6edf3;
+                    border-radius: 50%;
+                    transition: transform .15s ease;
+                }
+
+            .switch input:checked + .slider {
+                background: var(--accent-dim);
+            }
+
+                .switch input:checked + .slider::before {
+                    transform: translateX(16px);
+                    background: #06301d;
+                }
+    </style>
+</head>
+<body>
+
+    <div class="topbar">
+        <div class="brand"><span class="dot"></span>ZIP RUNNER</div>
+        <div class="file-info" id="fileInfo">No zip loaded</div>
+        <select class="entry-picker" id="entryPicker" style="display:none;"></select>
+        <button class="btn" id="reloadBtn" style="display:none;">Reload</button>
+        <button class="btn" id="loadAnotherBtn" style="display:none;">Load another .zip</button>
+        <button class="btn" id="fullscreenBtn" style="display:none;">⛶ Fullscreen</button>
+        <button class="btn" id="consoleBtn">Console <span id="consoleBadge" style="display:none;background:var(--danger);color:#fff;border-radius:9px;padding:1px 6px;font-size:10px;margin-left:4px;">0</span></button>
+        <button class="btn btn-primary" id="chooseBtn">Choose .zip</button>
+        <input type="file" id="fileInput" accept=".zip,application/zip,application/x-zip-compressed">
+    </div>
+
+    <div class="game-area">
+        <div class="sidebar">
+            <div class="sidebar-header">Your Games</div>
+            <div class="sidebar-list" id="sidebarList">
+                <div class="sidebar-empty" id="sidebarEmpty">No games yet. Load a .zip to add it to your library — it'll be saved here automatically.</div>
+            </div>
+        </div>
+
+        <div class="stage" id="stage">
+            <div class="dropzone" id="dropzone">
+                <div class="dz-card">
+                    <svg class="dz-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path d="M20 8v11a1 1 0 01-1 1H5a1 1 0 01-1-1V5a1 1 0 011-1h9l6 6z" stroke-linejoin="round" />
+                        <path d="M14 4v5a1 1 0 001 1h5" stroke-linejoin="round" />
+                        <path d="M9.5 12.5h1.5v1.5H9.5zM9.5 15.5h1.5V17H9.5zM9.5 9.5h1.5V11H9.5z" />
+                    </svg>
+                    <h1>Drop a game .zip here</h1>
+                    <p>
+                        Works with a plain <code>.html</code> + <code>.js</code> zip, or a
+                        React/Vite/TypeScript source project (with <code>package.json</code>) —
+                        it'll be compiled in your browser. No password-protected zips.
+                        Nothing is uploaded anywhere; everything happens locally, and games
+                        you load are saved to your library on the left.
+                    </p>
+                    <button class="btn btn-primary" id="dzChooseBtn">Choose .zip file</button>
+                    <div class="dz-hint">Looks for index.html at the root, or lets you pick which file to launch.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="status-bar" id="statusBar" style="display:none;">
+        <div id="statusText"></div>
+        <div class="right" id="statusRight"></div>
+    </div>
+
+    <!-- Bottom dock -->
+    <div class="dock" id="dock">
+        <button class="dock-btn" id="dockGpuBtn" title="GPU / WebGL settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="M7 9h2v2H7zM11 9h2v2h-2zM15 9h2v2h-2zM7 13h6v2H7z" /></svg>
+        </button>
+        <button class="dock-btn" id="dockToggleBtn" title="Toggles">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="6" rx="3" /><circle cx="8" cy="9" r="2.2" fill="currentColor" stroke="none" /><rect x="2" y="14" width="20" height="6" rx="3" /><circle cx="17" cy="17" r="2.2" fill="currentColor" stroke="none" /></svg>
+        </button>
+        <button class="dock-btn" id="dockResBtn" title="Resolution">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2" /><path d="M8 21h8M12 17v4" /></svg>
+        </button>
+    </div>
+
+    <!-- GPU / WebGL settings panel -->
+    <div class="dock-panel" id="gpuPanel">
+        <h3>GPU / WebGL Settings</h3>
+        <div class="panel-row">
+            <label for="gpuPowerPref">Power preference</label>
+            <select class="panel-select" id="gpuPowerPref">
+                <option value="default">Default</option>
+                <option value="high-performance">High performance</option>
+                <option value="low-power">Low power</option>
+            </select>
+        </div>
+        <div class="panel-row">
+            <label for="gpuAntialias">Antialiasing</label>
+            <label class="switch" for="gpuAntialias"><input type="checkbox" id="gpuAntialias" checked><span class="slider"></span></label>
+        </div>
+        <div class="panel-row">
+            <label for="gpuAlpha">Canvas alpha (transparency)</label>
+            <label class="switch" for="gpuAlpha"><input type="checkbox" id="gpuAlpha" checked><span class="slider"></span></label>
+        </div>
+        <div class="panel-row">
+            <label for="gpuPreserveBuffer">Preserve drawing buffer</label>
+            <label class="switch" for="gpuPreserveBuffer"><input type="checkbox" id="gpuPreserveBuffer"><span class="slider"></span></label>
+        </div>
+        <div class="panel-row">
+            <label for="gpuFailCaveat">Fail on low-perf caveat</label>
+            <label class="switch" for="gpuFailCaveat"><input type="checkbox" id="gpuFailCaveat"><span class="slider"></span></label>
+        </div>
+        <div class="panel-note">
+            Applied by patching <code>canvas.getContext()</code> inside the game before
+            it loads, so it only takes effect for WebGL contexts the game creates
+            after launch/reload — some games may ignore these hints entirely.
+        </div>
+    </div>
+
+    <!-- Toggles panel -->
+    <div class="dock-panel" id="togglesPanel">
+        <h3>Toggles</h3>
+        <div class="panel-row">
+            <label for="toggleMute">Mute audio</label>
+            <label class="switch" for="toggleMute"><input type="checkbox" id="toggleMute"><span class="slider"></span></label>
+        </div>
+        <div class="panel-row">
+            <label for="toggleFps">Show FPS counter</label>
+            <label class="switch" for="toggleFps"><input type="checkbox" id="toggleFps"><span class="slider"></span></label>
+        </div>
+        <div class="panel-row">
+            <label for="togglePixelated">Pixelated scaling (crisp pixel art)</label>
+            <label class="switch" for="togglePixelated"><input type="checkbox" id="togglePixelated"><span class="slider"></span></label>
+        </div>
+        <div class="panel-row">
+            <label for="toggleNoPauseOnBlur">Keep running when tab loses focus</label>
+            <label class="switch" for="toggleNoPauseOnBlur"><input type="checkbox" id="toggleNoPauseOnBlur"><span class="slider"></span></label>
+        </div>
+        <div class="panel-note">
+            Some toggles need a relaunch to take effect on the current game, since
+            they're applied via a shim injected before the game's own scripts run.
+        </div>
+    </div>
+
+    <!-- Resolution panel -->
+    <div class="dock-panel" id="resPanel">
+        <h3>Resolution</h3>
+        <div class="panel-row">
+            <label for="resPreset">Preset</label>
+            <select class="panel-select" id="resPreset">
+                <option value="fit">Fit window</option>
+                <option value="1280x720">1280 × 720</option>
+                <option value="1920x1080">1920 × 1080</option>
+                <option value="960x540">960 × 540</option>
+                <option value="800x600">800 × 600</option>
+                <option value="640x480">640 × 480</option>
+                <option value="custom">Custom…</option>
+            </select>
+        </div>
+        <div class="custom-res-row" id="customResRow" style="display:none;">
+            <input type="number" id="customResW" placeholder="W" min="64" max="7680">
+            <span>×</span>
+            <input type="number" id="customResH" placeholder="H" min="64" max="4320">
+            <button class="btn" id="customResApply" style="padding:5px 10px; font-size:12px;">Apply</button>
+        </div>
+        <div class="panel-note">
+            Sets the game's actual internal resolution (not just a resized box) —
+            the game genuinely renders at these dimensions, then gets scaled to
+            fit your screen. "Fit window" matches your available space exactly.
+            Works in fullscreen too.
+        </div>
+    </div>
+
+    <div id="debugConsole" class="debug-console">
+        <div class="debug-console-header">
+            <span>Debug Console</span>
+            <div style="display:flex; gap:8px;">
+                <button class="btn" id="consoleClearBtn" style="padding:4px 10px; font-size:12px;">Clear</button>
+                <button class="btn" id="consoleCloseBtn" style="padding:4px 10px; font-size:12px;">Close</button>
+            </div>
+        </div>
+        <div class="debug-console-body" id="debugConsoleBody"></div>
+    </div>
+
+    <script>
+        (function () {
+            const fileInput = document.getElementById('fileInput');
+            const chooseBtn = document.getElementById('chooseBtn');
+            const dzChooseBtn = document.getElementById('dzChooseBtn');
+            const reloadBtn = document.getElementById('reloadBtn');
+            const loadAnotherBtn = document.getElementById('loadAnotherBtn');
+            const fullscreenBtn = document.getElementById('fullscreenBtn');
+            const dropzone = document.getElementById('dropzone');
+            const stage = document.getElementById('stage');
+            const fileInfo = document.getElementById('fileInfo');
+            const entryPicker = document.getElementById('entryPicker');
+            const statusBar = document.getElementById('statusBar');
+            const statusText = document.getElementById('statusText');
+            const statusRight = document.getElementById('statusRight');
+
+            // Sidebar (game library)
+            const sidebarList = document.getElementById('sidebarList');
+            const sidebarEmpty = document.getElementById('sidebarEmpty');
+
+            // Dock + settings panels
+            const dockGpuBtn = document.getElementById('dockGpuBtn');
+            const dockToggleBtn = document.getElementById('dockToggleBtn');
+            const dockResBtn = document.getElementById('dockResBtn');
+            const gpuPanel = document.getElementById('gpuPanel');
+            const togglesPanel = document.getElementById('togglesPanel');
+            const resPanel = document.getElementById('resPanel');
+            const gpuPowerPref = document.getElementById('gpuPowerPref');
+            const gpuAntialias = document.getElementById('gpuAntialias');
+            const gpuAlpha = document.getElementById('gpuAlpha');
+            const gpuPreserveBuffer = document.getElementById('gpuPreserveBuffer');
+            const gpuFailCaveat = document.getElementById('gpuFailCaveat');
+            const toggleMute = document.getElementById('toggleMute');
+            const toggleFps = document.getElementById('toggleFps');
+            const togglePixelated = document.getElementById('togglePixelated');
+            const toggleNoPauseOnBlur = document.getElementById('toggleNoPauseOnBlur');
+            const resPreset = document.getElementById('resPreset');
+            const customResRow = document.getElementById('customResRow');
+            const customResW = document.getElementById('customResW');
+            const customResH = document.getElementById('customResH');
+            const customResApply = document.getElementById('customResApply');
+
+            // ---- Debug console ----
+            const debugConsole = document.getElementById('debugConsole');
+            const debugConsoleBody = document.getElementById('debugConsoleBody');
+            const consoleBtn = document.getElementById('consoleBtn');
+            const consoleBadge = document.getElementById('consoleBadge');
+            const consoleClearBtn = document.getElementById('consoleClearBtn');
+            const consoleCloseBtn = document.getElementById('consoleCloseBtn');
+            let unreadErrorCount = 0;
+
+            function logToConsole(source, level, args) {
+                // source: 'parent' | 'iframe' | 'resource'
+                // level: 'log' | 'info' | 'warn' | 'error'
+                const entry = document.createElement('div');
+                entry.className = `console-entry source-${source} level-${level}`;
+                const time = new Date().toLocaleTimeString([], { hour12: false }) + '.' + String(new Date().getMilliseconds()).padStart(3, '0');
+                const tagLabel = source === 'parent' ? 'RUNNER' : source === 'iframe' ? 'GAME' : 'RESOURCE';
+                const meta = document.createElement('div');
+                meta.className = 'meta';
+                meta.innerHTML = `<span class="tag">${tagLabel}</span><span>${escapeHtml(time)}</span><span>${escapeHtml(level.toUpperCase())}</span>`;
+                const body = document.createElement('div');
+                const text = args.map(a => {
+                    if (a instanceof Error) return a.stack || a.message;
+                    if (typeof a === 'object') { try { return JSON.stringify(a, null, 2); } catch (e) { return String(a); } }
+                    return String(a);
+                }).join(' ');
+                body.textContent = text;
+                entry.appendChild(meta);
+                entry.appendChild(body);
+                debugConsoleBody.appendChild(entry);
+                debugConsoleBody.scrollTop = debugConsoleBody.scrollHeight;
+
+                if (level === 'error' || level === 'warn') {
+                    unreadErrorCount++;
+                    consoleBadge.textContent = String(unreadErrorCount);
+                    consoleBadge.style.display = 'inline-block';
+                }
+            }
+
+            consoleBtn.addEventListener('click', () => {
+                debugConsole.classList.toggle('open');
+                if (debugConsole.classList.contains('open')) {
+                    unreadErrorCount = 0;
+                    consoleBadge.style.display = 'none';
+                }
+            });
+            consoleCloseBtn.addEventListener('click', () => debugConsole.classList.remove('open'));
+            consoleClearBtn.addEventListener('click', () => { debugConsoleBody.innerHTML = ''; });
+
+            // Mirror this (parent/runner) page's own console output into the panel too,
+            // without breaking normal devtools output.
+            ['log', 'info', 'warn', 'error'].forEach(level => {
+                const orig = console[level].bind(console);
+                console[level] = (...args) => {
+                    orig(...args);
+                    logToConsole('parent', level, args);
+                };
+            });
+
+            // Catch uncaught errors / promise rejections in the parent (runner) page itself.
+            window.addEventListener('error', (e) => {
+                // Resource load errors (img/script/link failing to load) fire 'error' events
+                // that don't bubble normally but ARE captured here via the capture phase.
+                if (e.target && e.target !== window && (e.target.tagName === 'IMG' || e.target.tagName === 'SCRIPT' || e.target.tagName === 'LINK')) {
+                    logToConsole('resource', 'error', [`Failed to load ${e.target.tagName.toLowerCase()}: ${e.target.src || e.target.href}`]);
+                    return;
+                }
+                logToConsole('parent', 'error', [e.message + (e.filename ? ` (${e.filename}:${e.lineno}:${e.colno})` : '')]);
+            }, true);
+            window.addEventListener('unhandledrejection', (e) => {
+                logToConsole('parent', 'error', ['Unhandled promise rejection:', e.reason]);
+            });
+
+            // Receive forwarded console/error messages from inside the launched game
+            // iframe (injected there via a small shim script, since the sandboxed
+            // iframe's own console isn't otherwise visible to us).
+            window.addEventListener('message', (e) => {
+                if (!e.data || e.data.__gameRunnerDebug !== true) return;
+                logToConsole('iframe', e.data.level || 'log', e.data.args || []);
+            });
+
+            // Injected into every launched game iframe. Forwards the game's own
+            // console.log/warn/error, uncaught errors, unhandled promise rejections,
+            // and failed resource loads (img/script/link/etc.) back to the parent
+            // runner page via postMessage, so they show up in the Debug Console panel
+            // even though the sandboxed iframe's devtools console isn't otherwise
+            // visible to us from outside.
+            const debugShim = `
+<script>
+(function(){
+          function send(level, args) {
+            try {
+              window.parent.postMessage({
+                __gameRunnerDebug: true,
+                level: level,
+                args: args.map(function(a){
+                  if (a instanceof Error) return (a.stack || a.message || String(a));
+                  if (typeof a === 'object' && a !== null) { try { return JSON.stringify(a); } catch(e) { return String(a); } }
+                  return String(a);
+                })
+              }, '*');
+            } catch (e) {}
+          }
+          ['log','info','warn','error','debug'].forEach(function(level){
+            var orig = console[level] ? console[level].bind(console) : function(){};
+            console[level] = function(){
+              orig.apply(console, arguments);
+              send(level === 'debug' ? 'log' : level, Array.prototype.slice.call(arguments));
+            };
+          });
+          window.addEventListener('error', function(e){
+            if (e.target && e.target !== window && e.target.tagName) {
+              var t = e.target;
+              var url = t.src || t.href || '(unknown resource)';
+              send('error', ['Failed to load ' + t.tagName.toLowerCase() + ': ' + url]);
+              return;
+            }
+            send('error', [e.message + ' (' + (e.filename||'') + ':' + e.lineno + ':' + e.colno + ')']);
+          }, true);
+          window.addEventListener('unhandledrejection', function(e){
+            var reason = e.reason;
+            send('error', ['Unhandled promise rejection: ' + (reason && reason.stack ? reason.stack : String(reason))]);
+          });
+          send('log', ['[debug shim active]']);
+})();
+<\/script>`;
+
+            // Injected into every launched game iframe alongside debugShim. Applies
+            // GPU/WebGL hints and toggle settings. Two mechanisms:
+            //  1. Patches HTMLCanvasElement.prototype.getContext so any webgl/webgl2
+            //     context the game creates gets our chosen context-attribute hints
+            //     merged in (power preference, antialias, alpha, etc). This is
+            //     best-effort: it only affects *new* contexts created after this shim
+            //     runs (i.e. requires a relaunch/reload to pick up changes), and a
+            //     game that explicitly overrides these attributes wins over our hints
+            //     since we only fill in ones the game didn't already specify.
+            //  2. Applies toggles (mute, pixelated canvas scaling) at page-load time,
+            //     and listens for postMessage updates from the parent so mute/FPS
+            //     can change live without a relaunch.
+            function buildSettingsShim(gpuSettings, toggleSettings) {
+                return `
+<script>
+(function(){
+          var GPU = ${JSON.stringify(gpuSettings)};
+          var TOGGLES = ${JSON.stringify(toggleSettings)};
+
+          // ---- WebGL context attribute patch ----
+          var origGetContext = HTMLCanvasElement.prototype.getContext;
+          HTMLCanvasElement.prototype.getContext = function(type, attrs) {
+            if (type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl') {
+              attrs = attrs || {};
+              // Only fill in attributes the game didn't itself specify, so explicit
+              // game preferences always win over our hints.
+              if (attrs.powerPreference === undefined && GPU.powerPreference !== 'default') attrs.powerPreference = GPU.powerPreference;
+              if (attrs.antialias === undefined) attrs.antialias = GPU.antialias;
+              if (attrs.alpha === undefined) attrs.alpha = GPU.alpha;
+              if (attrs.preserveDrawingBuffer === undefined) attrs.preserveDrawingBuffer = GPU.preserveDrawingBuffer;
+              if (attrs.failIfMajorPerformanceCaveat === undefined) attrs.failIfMajorPerformanceCaveat = GPU.failIfMajorPerformanceCaveat;
+            }
+            return origGetContext.call(this, type, attrs);
+          };
+
+          // ---- Toggles ----
+          function applyPixelated(on) {
+            var style = document.getElementById('__grPixelatedStyle');
+            if (on) {
+              if (!style) {
+                style = document.createElement('style');
+                style.id = '__grPixelatedStyle';
+                style.textContent = 'canvas { image-rendering: pixelated; image-rendering: crisp-edges; }';
+                document.head.appendChild(style);
+              }
+            } else if (style) {
+              style.remove();
+            }
+          }
+
+          function applyMute(on) {
+            document.querySelectorAll('audio, video').forEach(function(el){
+              el.muted = !!on;
+            });
+            if (on && window.AudioContext) {
+              // Best-effort: suspend any AudioContext instances the game created,
+              // so procedurally-generated audio (Web Audio API) is silenced too,
+              // not just <audio>/<video> elements.
+              if (window.__grAudioContexts) {
+                window.__grAudioContexts.forEach(function(ctx){ try { ctx.suspend(); } catch(e){} });
+              }
+            } else if (!on && window.__grAudioContexts) {
+              window.__grAudioContexts.forEach(function(ctx){ try { ctx.resume(); } catch(e){} });
+            }
+          }
+          // Track AudioContext instances so applyMute can reach them.
+          window.__grAudioContexts = [];
+          ['AudioContext', 'webkitAudioContext'].forEach(function(name){
+            var OrigCtx = window[name];
+            if (!OrigCtx) return;
+            window[name] = function(){
+              var ctx = new (Function.prototype.bind.apply(OrigCtx, [null].concat(Array.prototype.slice.call(arguments))))();
+              window.__grAudioContexts.push(ctx);
+              return ctx;
+            };
+            window[name].prototype = OrigCtx.prototype;
+          });
+
+          function applyNoPauseOnBlur(on) {
+            if (!on) return; // default browser/game behavior is left alone
+            // Some games pause on visibilitychange/blur; we can't force a game's own
+            // logic to ignore that, but we CAN stop this frame from reporting itself
+            // as hidden/blurred, which is what most such logic checks.
+            try {
+              Object.defineProperty(document, 'hidden', { get: function(){ return false; } });
+              Object.defineProperty(document, 'visibilityState', { get: function(){ return 'visible'; } });
+            } catch(e) {}
+            window.addEventListener('blur', function(e){ e.stopImmediatePropagation(); }, true);
+          }
+
+          function applyAll(toggles) {
+            applyPixelated(!!toggles.pixelated);
+            applyMute(!!toggles.mute);
+            applyNoPauseOnBlur(!!toggles.noPauseOnBlur);
+          }
+
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', function(){ applyAll(TOGGLES); });
+          } else {
+            applyAll(TOGGLES);
+          }
+
+          window.addEventListener('message', function(e){
+            if (!e.data || e.data.__gameRunnerSettings !== true) return;
+            applyAll(e.data.toggles || {});
+          });
+})();
+<\/script>`;
+            }
+
+            let currentZipFile = null;   // raw File
+            let blobUrlMap = null;       // path -> blob url (for cleanup, static mode)
+            let projectBlobUrls = [];    // blob urls created in project (build) mode, for cleanup
+            let currentFrame = null;
+            let currentFrameWrapper = null; // wraps currentFrame; see .game-frame-wrapper CSS notes
+            let htmlEntries = [];        // list of html paths found in zip
+            let currentLibraryId = null; // id of the currently-loaded game in the library, if any
+            let fpsRafHandle = null;
+
+            // Persisted settings (GPU/WebGL hints, toggles, resolution). Small and
+            // simple enough for localStorage; the game library itself (zip bytes) goes
+            // in IndexedDB since it needs much more space.
+            const DEFAULT_SETTINGS = {
+                gpu: { powerPreference: 'default', antialias: true, alpha: true, preserveDrawingBuffer: false, failIfMajorPerformanceCaveat: false },
+                toggles: { mute: false, fps: false, pixelated: false, noPauseOnBlur: false },
+                resolution: { mode: 'fit', w: 1280, h: 720 }
+            };
+            let settings = loadSettings();
+
+            function loadSettings() {
+                try {
+                    const raw = localStorage.getItem('gameRunnerSettings');
+                    if (!raw) return JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+                    const parsed = JSON.parse(raw);
+                    // Shallow-merge over defaults so new settings added later still get sane values.
+                    return {
+                        gpu: Object.assign({}, DEFAULT_SETTINGS.gpu, parsed.gpu),
+                        toggles: Object.assign({}, DEFAULT_SETTINGS.toggles, parsed.toggles),
+                        resolution: Object.assign({}, DEFAULT_SETTINGS.resolution, parsed.resolution)
+                    };
+                } catch (e) {
+                    return JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+                }
+            }
+
+            function saveSettings() {
+                try { localStorage.setItem('gameRunnerSettings', JSON.stringify(settings)); } catch (e) { }
+            }
+
+            // ---- Dock + settings panels ----
+            function closeAllDockPanels() {
+                [gpuPanel, togglesPanel, resPanel].forEach(p => p.classList.remove('open'));
+                [dockGpuBtn, dockToggleBtn, dockResBtn].forEach(b => b.classList.remove('active'));
+            }
+
+            function toggleDockPanel(panel, btn) {
+                const wasOpen = panel.classList.contains('open');
+                closeAllDockPanels();
+                if (!wasOpen) {
+                    panel.classList.add('open');
+                    btn.classList.add('active');
+                }
+            }
+
+            dockGpuBtn.addEventListener('click', () => toggleDockPanel(gpuPanel, dockGpuBtn));
+            dockToggleBtn.addEventListener('click', () => toggleDockPanel(togglesPanel, dockToggleBtn));
+            dockResBtn.addEventListener('click', () => toggleDockPanel(resPanel, dockResBtn));
+
+            // Close panels when clicking elsewhere (but not on the dock/panels themselves)
+            document.addEventListener('click', (e) => {
+                if (e.target.closest('.dock') || e.target.closest('.dock-panel')) return;
+                closeAllDockPanels();
+            });
+
+            function syncSettingsUI() {
+                gpuPowerPref.value = settings.gpu.powerPreference;
+                gpuAntialias.checked = settings.gpu.antialias;
+                gpuAlpha.checked = settings.gpu.alpha;
+                gpuPreserveBuffer.checked = settings.gpu.preserveDrawingBuffer;
+                gpuFailCaveat.checked = settings.gpu.failIfMajorPerformanceCaveat;
+
+                toggleMute.checked = settings.toggles.mute;
+                toggleFps.checked = settings.toggles.fps;
+                togglePixelated.checked = settings.toggles.pixelated;
+                toggleNoPauseOnBlur.checked = settings.toggles.noPauseOnBlur;
+
+                resPreset.value = settings.resolution.mode;
+                customResRow.style.display = settings.resolution.mode === 'custom' ? 'flex' : 'none';
+                customResW.value = settings.resolution.w;
+                customResH.value = settings.resolution.h;
+            }
+
+            // GPU settings: these only take effect on the NEXT launch/reload (the shim
+            // is injected before the game's scripts run), so changing them live-updates
+            // a couple of cosmetic things but mainly just persists the choice.
+            [[gpuPowerPref, 'powerPreference', 'value'], [gpuAntialias, 'antialias', 'checked'],
+            [gpuAlpha, 'alpha', 'checked'], [gpuPreserveBuffer, 'preserveDrawingBuffer', 'checked'],
+            [gpuFailCaveat, 'failIfMajorPerformanceCaveat', 'checked']].forEach(([el, key, prop]) => {
+                el.addEventListener('change', () => {
+                    settings.gpu[key] = el[prop];
+                    saveSettings();
+                    setStatus('GPU setting saved — relaunch or reload the game to apply it.', {});
+                });
+            });
+
+            toggleMute.addEventListener('change', () => {
+                settings.toggles.mute = toggleMute.checked;
+                saveSettings();
+                applyLiveToggles(); // mute can apply live via postMessage, no relaunch needed
+            });
+            toggleFps.addEventListener('change', () => {
+                settings.toggles.fps = toggleFps.checked;
+                saveSettings();
+                applyLiveToggles();
+            });
+            togglePixelated.addEventListener('change', () => {
+                settings.toggles.pixelated = togglePixelated.checked;
+                saveSettings();
+                applyLiveToggles();
+            });
+            toggleNoPauseOnBlur.addEventListener('change', () => {
+                settings.toggles.noPauseOnBlur = toggleNoPauseOnBlur.checked;
+                saveSettings();
+                setStatus('Toggle saved — relaunch or reload the game to apply it.', {});
+            });
+
+            resPreset.addEventListener('change', () => {
+                settings.resolution.mode = resPreset.value;
+                if (resPreset.value !== 'custom' && resPreset.value !== 'fit') {
+                    const [w, h] = resPreset.value.split('x').map(Number);
+                    settings.resolution.w = w;
+                    settings.resolution.h = h;
+                }
+                customResRow.style.display = resPreset.value === 'custom' ? 'flex' : 'none';
+                saveSettings();
+                applyResolution();
+            });
+            customResApply.addEventListener('click', () => {
+                const w = Math.max(64, Math.min(7680, parseInt(customResW.value, 10) || DEFAULT_SETTINGS.resolution.w));
+                const h = Math.max(64, Math.min(4320, parseInt(customResH.value, 10) || DEFAULT_SETTINGS.resolution.h));
+                settings.resolution.w = w;
+                settings.resolution.h = h;
+                customResW.value = w;
+                customResH.value = h;
+                saveSettings();
+                applyResolution();
+            });
+
+            // Recompute the visual scale whenever the window resizes, or fullscreen
+            // is entered/exited (the available space changes in both cases).
+            window.addEventListener('resize', () => applyResolution());
+            document.addEventListener('fullscreenchange', () => applyResolution());
+
+            // Wraps a freshly-created game iframe in a .game-frame-wrapper and mounts
+            // it into the stage. Centralizes this so both launch paths stay in sync.
+            function mountGameFrame(iframe) {
+                const wrapper = document.createElement('div');
+                wrapper.className = 'game-frame-wrapper';
+                wrapper.appendChild(iframe);
+                stage.appendChild(wrapper);
+                currentFrame = iframe;
+                currentFrameWrapper = wrapper;
+                applyResolution();
+            }
+
+            function unmountGameFrame() {
+                if (document.fullscreenElement === currentFrameWrapper) {
+                    document.exitFullscreen().catch(() => { });
+                }
+                if (currentFrameWrapper && currentFrameWrapper.parentNode) {
+                    currentFrameWrapper.parentNode.removeChild(currentFrameWrapper);
+                }
+                currentFrame = null;
+                currentFrameWrapper = null;
+            }
+
+            function applyResolution() {
+                if (!currentFrame || !currentFrameWrapper) return;
+
+                const inFullscreen = document.fullscreenElement === currentFrameWrapper;
+                const availW = inFullscreen ? window.innerWidth : stage.clientWidth;
+                const availH = inFullscreen ? window.innerHeight : stage.clientHeight;
+
+                if (settings.resolution.mode === 'fit') {
+                    // "Fit window": the iframe's true internal resolution just IS the
+                    // available space, 1:1, no scaling layer needed. This is the one mode
+                    // where "resolution" and "how big it looks" are intentionally the same
+                    // thing.
+                    currentFrame.style.width = `${Math.round(availW)}px`;
+                    currentFrame.style.height = `${Math.round(availH)}px`;
+                    currentFrameWrapper.style.width = `${Math.round(availW)}px`;
+                    currentFrameWrapper.style.height = `${Math.round(availH)}px`;
+                    currentFrameWrapper.style.transform = 'none';
+                    return;
+                }
+
+                // Fixed resolution: the iframe is set to the EXACT chosen resolution in
+                // real pixels -- this is what the game's own viewport/canvas sizing
+                // logic actually sees, so it's a genuine resolution change, not just a
+                // CSS box resize. We then scale the whole wrapper up/down with a CSS
+                // transform so it visually fits the available space (stage panel, or
+                // the full screen when in fullscreen) while the iframe underneath keeps
+                // rendering at the real target resolution the whole time.
+                const targetW = settings.resolution.w;
+                const targetH = settings.resolution.h;
+                currentFrame.style.width = `${targetW}px`;
+                currentFrame.style.height = `${targetH}px`;
+                currentFrameWrapper.style.width = `${targetW}px`;
+                currentFrameWrapper.style.height = `${targetH}px`;
+
+                const scale = Math.min(availW / targetW, availH / targetH) || 1;
+                currentFrameWrapper.style.transform = `scale(${scale})`;
+            }
+
+
+            // Sends live-toggle state into the running game iframe via postMessage.
+            // The debug/settings shim inside the iframe listens for this message and
+            // applies what it can (mute, FPS overlay, pixelated rendering hint).
+            function applyLiveToggles() {
+                if (!currentFrame || !currentFrame.contentWindow) return;
+                try {
+                    currentFrame.contentWindow.postMessage({
+                        __gameRunnerSettings: true,
+                        toggles: settings.toggles
+                    }, '*');
+                } catch (e) { }
+                updateFpsOverlay();
+            }
+
+            let fpsOverlayEl = null;
+            function updateFpsOverlay() {
+                if (settings.toggles.fps) {
+                    if (!fpsOverlayEl) {
+                        fpsOverlayEl = document.createElement('div');
+                        fpsOverlayEl.className = 'fps-overlay';
+                        fpsOverlayEl.textContent = 'FPS: --';
+                    }
+                    if (!stage.contains(fpsOverlayEl)) stage.appendChild(fpsOverlayEl);
+                } else if (fpsOverlayEl && fpsOverlayEl.parentNode) {
+                    fpsOverlayEl.parentNode.removeChild(fpsOverlayEl);
+                }
+            }
+
+            // We measure FPS from the parent side (rAF loop here), since it works
+            // regardless of what's happening inside the sandboxed iframe -- it's an
+            // approximation of overall page smoothness rather than the game's exact
+            // internal frame rate, but it's a reasonable proxy and needs no cooperation
+            // from the game's code.
+            function startFpsLoop() {
+                let last = performance.now();
+                let frames = 0;
+                let lastReport = last;
+                function tick(now) {
+                    frames++;
+                    if (now - lastReport >= 500) {
+                        const fps = Math.round((frames * 1000) / (now - lastReport));
+                        if (fpsOverlayEl) fpsOverlayEl.textContent = `FPS: ${fps}`;
+                        frames = 0;
+                        lastReport = now;
+                    }
+                    fpsRafHandle = requestAnimationFrame(tick);
+                }
+                fpsRafHandle = requestAnimationFrame(tick);
+            }
+            startFpsLoop(); // runs continuously; overlay visibility is what actually gates display
+
+            // ---- Game library (IndexedDB) ----
+            // Stores every zip ever loaded so it persists across reloads: id, name,
+            // the raw zip bytes (as base64, since IndexedDB structured-clone can store
+            // ArrayBuffers directly too, but base64 keeps this simple and consistent
+            // with the rest of the app's data-URI approach), size, and timestamps.
+            const DB_NAME = 'gameRunnerLibrary';
+            const DB_VERSION = 1;
+            const STORE_NAME = 'games';
+            let dbPromise = null;
+
+            function openDb() {
+                if (dbPromise) return dbPromise;
+                dbPromise = new Promise((resolve, reject) => {
+                    const req = indexedDB.open(DB_NAME, DB_VERSION);
+                    req.onupgradeneeded = () => {
+                        const db = req.result;
+                        if (!db.objectStoreNames.contains(STORE_NAME)) {
+                            const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+                            store.createIndex('lastPlayed', 'lastPlayed');
+                        }
+                    };
+                    req.onsuccess = () => resolve(req.result);
+                    req.onerror = () => reject(req.error);
+                });
+                return dbPromise;
+            }
+
+            function dbTx(mode) {
+                return openDb().then(db => db.transaction(STORE_NAME, mode).objectStore(STORE_NAME));
+            }
+
+            function idbRequestToPromise(req) {
+                return new Promise((resolve, reject) => {
+                    req.onsuccess = () => resolve(req.result);
+                    req.onerror = () => reject(req.error);
+                });
+            }
+
+            async function libraryList() {
+                const store = await dbTx('readonly');
+                const all = await idbRequestToPromise(store.getAll());
+                return all.sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0));
+            }
+
+            async function libraryGet(id) {
+                const store = await dbTx('readonly');
+                return idbRequestToPromise(store.get(id));
+            }
+
+            async function libraryPut(entry) {
+                const store = await dbTx('readwrite');
+                return idbRequestToPromise(store.put(entry));
+            }
+
+            async function libraryDelete(id) {
+                const store = await dbTx('readwrite');
+                return idbRequestToPromise(store.delete(id));
+            }
+
+            function arrayBufferToBase64(buf) {
+                const bytes = new Uint8Array(buf);
+                let binary = '';
+                const chunkSize = 0x8000;
+                for (let i = 0; i < bytes.length; i += chunkSize) {
+                    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+                }
+                return btoa(binary);
+            }
+
+            function base64ToArrayBuffer(base64) {
+                const binary = atob(base64);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                return bytes.buffer;
+            }
+
+            // Adds a newly-loaded zip File to the library (or updates lastPlayed if a
+            // byte-identical one was already saved under a different load). Returns
+            // the library entry id.
+            async function addToLibrary(file) {
+                const buf = await file.arrayBuffer();
+                const id = 'game_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+                const entry = {
+                    id,
+                    name: file.name.replace(/\.zip$/i, ''),
+                    size: file.size,
+                    dataBase64: arrayBufferToBase64(buf),
+                    addedAt: Date.now(),
+                    lastPlayed: Date.now()
+                };
+                await libraryPut(entry);
+                return id;
+            }
+
+            async function touchLastPlayed(id) {
+                const entry = await libraryGet(id);
+                if (!entry) return;
+                entry.lastPlayed = Date.now();
+                await libraryPut(entry);
+            }
+
+            async function renameLibraryEntry(id, newName) {
+                const entry = await libraryGet(id);
+                if (!entry) return;
+                entry.name = newName;
+                await libraryPut(entry);
+            }
+
+            function formatRelativeTime(ts) {
+                const diff = Date.now() - ts;
+                const mins = Math.floor(diff / 60000);
+                if (mins < 1) return 'just now';
+                if (mins < 60) return `${mins}m ago`;
+                const hrs = Math.floor(mins / 60);
+                if (hrs < 24) return `${hrs}h ago`;
+                const days = Math.floor(hrs / 24);
+                if (days < 30) return `${days}d ago`;
+                return new Date(ts).toLocaleDateString();
+            }
+
+            async function renderSidebar() {
+                let entries;
+                try {
+                    entries = await libraryList();
+                } catch (e) {
+                    logToConsole('parent', 'error', ['Failed to read game library: ' + (e && e.message ? e.message : String(e))]);
+                    return;
+                }
+                sidebarList.innerHTML = '';
+                if (entries.length === 0) {
+                    sidebarList.appendChild(sidebarEmpty);
+                    return;
+                }
+                entries.forEach(entry => {
+                    const item = document.createElement('div');
+                    item.className = 'game-item' + (entry.id === currentLibraryId ? ' active' : '');
+                    item.innerHTML = `
+                <div class="game-item-icon">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 8v11a1 1 0 01-1 1H5a1 1 0 01-1-1V5a1 1 0 011-1h9l6 6z" stroke-linejoin="round"/><path d="M14 4v5a1 1 0 001 1h5" stroke-linejoin="round"/></svg>
+                </div>
+                <div class="game-item-info">
+                  <div class="game-item-name" data-id="${escapeHtml(entry.id)}">${escapeHtml(entry.name)}</div>
+                  <div class="game-item-meta">${(entry.size / 1024).toFixed(0)} KB · ${escapeHtml(formatRelativeTime(entry.lastPlayed || entry.addedAt))}</div>
+                </div>
+                <div class="game-item-actions">
+                  <button class="renameBtn" title="Rename">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.12 2.12 0 013 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>
+                  </button>
+                  <button class="deleteBtn danger" title="Delete">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z"/></svg>
+                  </button>
+                </div>`;
+
+                    const nameEl = item.querySelector('.game-item-name');
+                    item.addEventListener('click', (e) => {
+                        if (e.target.closest('.game-item-actions') || nameEl.isContentEditable) return;
+                        launchFromLibrary(entry.id);
+                    });
+
+                    item.querySelector('.renameBtn').addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        startRename(nameEl, entry.id);
+                    });
+                    item.querySelector('.deleteBtn').addEventListener('click', async (e) => {
+                        e.stopPropagation();
+                        if (!confirm(`Delete "${entry.name}" from your library? This can't be undone.`)) return;
+                        await libraryDelete(entry.id);
+                        if (currentLibraryId === entry.id) {
+                            currentLibraryId = null;
+                        }
+                        renderSidebar();
+                    });
+
+                    sidebarList.appendChild(item);
+                });
+            }
+
+            function startRename(nameEl, id) {
+                const originalName = nameEl.textContent;
+                nameEl.contentEditable = 'true';
+                nameEl.focus();
+                document.execCommand && selectAllText(nameEl);
+
+                const finish = async (commit) => {
+                    nameEl.contentEditable = 'false';
+                    nameEl.removeEventListener('blur', onBlur);
+                    nameEl.removeEventListener('keydown', onKeydown);
+                    const newName = nameEl.textContent.trim();
+                    if (commit && newName && newName !== originalName) {
+                        await renameLibraryEntry(id, newName);
+                    } else {
+                        nameEl.textContent = originalName;
+                    }
+                    renderSidebar();
+                };
+                const onBlur = () => finish(true);
+                const onKeydown = (e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+                    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+                };
+                nameEl.addEventListener('blur', onBlur);
+                nameEl.addEventListener('keydown', onKeydown);
+            }
+
+            function selectAllText(el) {
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+            }
+
+            async function launchFromLibrary(id) {
+                const entry = await libraryGet(id);
+                if (!entry) return;
+                const buf = base64ToArrayBuffer(entry.dataBase64);
+                const file = new File([buf], entry.name + '.zip', { type: 'application/zip' });
+                currentLibraryId = id;
+                await touchLastPlayed(id);
+                renderSidebar();
+                handleZipFile(file, false, /* skipLibrarySave */ true);
+            }
+
+            chooseBtn.addEventListener('click', () => fileInput.click());
+            dzChooseBtn.addEventListener('click', () => fileInput.click());
+            loadAnotherBtn.addEventListener('click', () => fileInput.click());
+
+            fileInput.addEventListener('change', (e) => {
+                if (e.target.files && e.target.files[0]) {
+                    handleZipFile(e.target.files[0]);
+                }
+            });
+
+            // Drag & drop
+            ['dragenter', 'dragover'].forEach(evt => {
+                dropzone.addEventListener(evt, (e) => {
+                    e.preventDefault();
+                    dropzone.classList.add('dragover');
+                });
+            });
+            ['dragleave', 'drop'].forEach(evt => {
+                dropzone.addEventListener(evt, (e) => {
+                    e.preventDefault();
+                    dropzone.classList.remove('dragover');
+                });
+            });
+            dropzone.addEventListener('drop', (e) => {
+                const dt = e.dataTransfer;
+                if (dt && dt.files && dt.files[0]) {
+                    handleZipFile(dt.files[0]);
+                }
+            });
+            // Also allow dropping anywhere on stage once a game is loaded
+            ['dragenter', 'dragover'].forEach(evt => {
+                stage.addEventListener(evt, (e) => e.preventDefault());
+            });
+            stage.addEventListener('drop', (e) => {
+                e.preventDefault();
+                const dt = e.dataTransfer;
+                if (dt && dt.files && dt.files[0] && dt.files[0].name.toLowerCase().endsWith('.zip')) {
+                    handleZipFile(dt.files[0]);
+                }
+            });
+
+            reloadBtn.addEventListener('click', () => {
+                if (currentZipFile) handleZipFile(currentZipFile, true);
+            });
+
+            fullscreenBtn.addEventListener('click', () => {
+                if (document.fullscreenElement) {
+                    document.exitFullscreen().catch(() => { });
+                    return;
+                }
+                if (!currentFrameWrapper) return;
+                // Fullscreen the WRAPPER, not the iframe directly: the iframe is kept at
+                // its true fixed resolution and scaled visually via a CSS transform (see
+                // applyResolution()). If we fullscreened the iframe itself, the browser's
+                // fullscreen sizing would fight with our inline width/height/transform
+                // (inline styles win, so the iframe would stay pinned at its small
+                // pre-fullscreen pixel size instead of filling the screen). Fullscreening
+                // the wrapper lets applyResolution() recompute the scale against the new
+                // full-viewport size instead.
+                const req = currentFrameWrapper.requestFullscreen || currentFrameWrapper.webkitRequestFullscreen;
+                if (req) {
+                    req.call(currentFrameWrapper).catch(err => {
+                        logToConsole('parent', 'error', ['Fullscreen request failed: ' + (err && err.message ? err.message : String(err))]);
+                    });
+                } else {
+                    logToConsole('parent', 'warn', ['Fullscreen API not available in this browser.']);
+                }
+            });
+
+            document.addEventListener('fullscreenchange', () => {
+                fullscreenBtn.textContent = document.fullscreenElement ? '⤡ Exit Fullscreen' : '⛶ Fullscreen';
+            });
+
+            entryPicker.addEventListener('change', () => {
+                if (blobUrlMap && entryPicker.value) {
+                    launchEntry(entryPicker.value);
+                }
+            });
+
+            function setStatus(msg, opts) {
+                opts = opts || {};
+                statusBar.style.display = 'flex';
+                statusBar.classList.toggle('error', !!opts.error);
+                statusText.innerHTML = opts.spinner ? `<span class="spinner"></span>${escapeHtml(msg)}` : escapeHtml(msg);
+                statusRight.textContent = opts.right || '';
+            }
+
+            function escapeHtml(s) {
+                const d = document.createElement('div');
+                d.textContent = s;
+                return d.innerHTML;
+            }
+
+            function utf8ToBase64(str) {
+                // btoa() only handles Latin1; this correctly encodes arbitrary UTF-8 text
+                // (emoji, non-Latin scripts, etc.) that might appear in game source/text assets.
+                const bytes = new TextEncoder().encode(str);
+                let binary = '';
+                const chunkSize = 0x8000;
+                for (let i = 0; i < bytes.length; i += chunkSize) {
+                    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+                }
+                return btoa(binary);
+            }
+
+            function dataUriToText(dataUri) {
+                const match = /^data:[^,]*;base64,(.*)$/s.exec(dataUri);
+                if (match) {
+                    const binary = atob(match[1]);
+                    const bytes = new Uint8Array(binary.length);
+                    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                    return new TextDecoder().decode(bytes);
+                }
+                const plainMatch = /^data:[^,]*,(.*)$/s.exec(dataUri);
+                if (plainMatch) return decodeURIComponent(plainMatch[1]);
+                throw new Error('Not a data: URI: ' + String(dataUri).slice(0, 40));
+            }
+
+            function guessMime(path) {
+                const ext = path.split('.').pop().toLowerCase();
+                const map = {
+                    html: 'text/html', htm: 'text/html',
+                    js: 'application/javascript', mjs: 'application/javascript',
+                    css: 'text/css',
+                    json: 'application/json',
+                    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+                    gif: 'image/gif', svg: 'image/svg+xml', webp: 'image/webp',
+                    mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg',
+                    woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf',
+                    wasm: 'application/wasm',
+                    txt: 'text/plain', xml: 'application/xml',
+                    mp4: 'video/mp4', webm: 'video/webm'
+                };
+                return map[ext] || 'application/octet-stream';
+            }
+
+            function cleanupBlobs() {
+                if (blobUrlMap) {
+                    Object.values(blobUrlMap).forEach(url => {
+                        try { URL.revokeObjectURL(url); } catch (e) { }
+                    });
+                    blobUrlMap = null;
+                }
+                if (projectBlobUrls.length) {
+                    projectBlobUrls.forEach(url => {
+                        try { URL.revokeObjectURL(url); } catch (e) { }
+                    });
+                    projectBlobUrls = [];
+                }
+                if (currentFrame) {
+                    unmountGameFrame();
+                }
+                if (document.fullscreenElement) document.exitFullscreen().catch(() => { });
+                fullscreenBtn.style.display = 'none';
+            }
+
+            async function handleZipFile(file, isReload, skipLibrarySave) {
+                if (!file.name.toLowerCase().endsWith('.zip') && file.type !== 'application/zip' && file.type !== 'application/x-zip-compressed') {
+                    setStatus('That file doesn\'t look like a .zip. Please choose a .zip archive.', { error: true });
+                    return;
+                }
+
+                currentZipFile = file;
+                cleanupBlobs();
+                fileInfo.innerHTML = `<b>${escapeHtml(file.name)}</b> · ${(file.size / 1024).toFixed(1)} KB`;
+                setStatus('Reading zip archive…', { spinner: true });
+
+                // Save this zip into the persistent library so it shows up in the
+                // sidebar and survives page reloads -- but not when we're the ones
+                // reloading/relaunching an entry that's already in the library.
+                if (!skipLibrarySave && !isReload) {
+                    try {
+                        currentLibraryId = await addToLibrary(file);
+                        renderSidebar();
+                    } catch (err) {
+                        logToConsole('parent', 'error', ['Could not save this game to your library: ' + (err && err.message ? err.message : String(err))]);
+                    }
+                }
+
+                let zip;
+                try {
+                    zip = await JSZip.loadAsync(file);
+                } catch (err) {
+                    showError('Could not open this zip.', 'It may be password-protected, corrupted, or not a valid zip file. ' + (err && err.message ? err.message : ''));
+                    return;
+                }
+
+                // Reject encrypted entries (JSZip throws when reading them, but double check flags where possible)
+                const paths = Object.keys(zip.files).filter(p => !zip.files[p].dir);
+                if (paths.length === 0) {
+                    showError('This zip is empty.', 'Add an index.html and your game\'s .js files, then try again.');
+                    return;
+                }
+
+                // Detect a source project (React/Vite/etc.) vs a plain static HTML+JS bundle.
+                // A package.json alone is NOT sufficient evidence: tons of already-built
+                // games (itch.io HTML5 exports, Construct/GameMaker/Godot exports, Phaser/
+                // PixiJS CLI output, or just a game shipped alongside its dev tooling) carry
+                // a package.json but ship plain, already-compiled JS that just needs to be
+                // run as-is via the static path. Routing those into esbuild fails, because
+                // the "entry" is compiled output, not resolvable ES module source.
+                //
+                // So: only take the bundling path when there's real evidence of an *unbuilt*
+                // source project, specifically:
+                //   1. a package.json near the root, AND
+                //   2. an index.html whose entry <script> is type="module", AND
+                //   3. that entry script either has a .ts/.tsx/.jsx extension (can't run
+                //      unmodified in a browser at all -- needs a transpile), OR is a plain
+                //      .js/.mjs file that itself contains bare-specifier imports (e.g.
+                //      `import React from "react"`), which the browser can't resolve
+                //      without a bundler + import map.
+                // Anything else -- including "module script that's actually plain runnable
+                // JS with only relative imports" and "package.json but non-module script
+                // tag" -- falls through to the static file path below, same as a zip with
+                // no package.json at all.
+                const packageJsonPath = paths.find(p => /(^|\/)package\.json$/i.test(p) && p.split('/').length <= 2);
+                let needsBundling = false;
+                let bundlingProbeReason = '';
+                if (packageJsonPath) {
+                    const probeRoot = packageJsonPath.includes('/') ? packageJsonPath.slice(0, packageJsonPath.lastIndexOf('/') + 1) : '';
+                    const probeHtmlCandidates = paths.filter(p => p.startsWith(probeRoot) && /\.html?$/i.test(p));
+                    const probeEntryHtmlPath =
+                        probeHtmlCandidates.find(p => p.slice(probeRoot.length).toLowerCase() === 'index.html') ||
+                        probeHtmlCandidates.sort((a, b) => a.split('/').length - b.split('/').length)[0];
+
+                    if (probeEntryHtmlPath) {
+                        try {
+                            const probeHtml = await zip.files[probeEntryHtmlPath].async('string');
+                            const probeScriptMatch = probeHtml.match(/<script[^>]*\stype\s*=\s*["']module["'][^>]*\ssrc\s*=\s*["']([^"']+)["'][^>]*>/i);
+                            if (probeScriptMatch) {
+                                const probeEntryPath = probeScriptMatch[1].replace(/^\//, '');
+                                if (/\.(ts|tsx|jsx)$/i.test(probeEntryPath)) {
+                                    needsBundling = true;
+                                    bundlingProbeReason = 'entry script is ' + probeEntryPath.split('.').pop().toUpperCase() + ', which needs transpiling';
+                                } else {
+                                    // Plain .js/.mjs module entry: only bundle if it actually contains
+                                    // bare-specifier imports esbuild+importmap would be needed to resolve.
+                                    // A relative-only ("./", "../") import graph runs fine natively.
+                                    const fullEntryPath = probeRoot + probeEntryPath;
+                                    const matchPath = paths.find(p => p === fullEntryPath || p.endsWith('/' + probeEntryPath));
+                                    if (matchPath) {
+                                        try {
+                                            const entrySrc = await zip.files[matchPath].async('string');
+                                            const bareImportRe = /^\s*import\s[^'"]*['"](?!\.\/|\.\.\/|\/)[^'"]+['"]/m;
+                                            const bareImportRe2 = /import\s*\(\s*['"](?!\.\/|\.\.\/|\/)[^'"]+['"]/;
+                                            if (bareImportRe.test(entrySrc) || bareImportRe2.test(entrySrc)) {
+                                                needsBundling = true;
+                                                bundlingProbeReason = 'entry script imports packages by bare name (e.g. "react"), which needs resolving against a CDN';
+                                            }
+                                        } catch (e) { /* unreadable entry source; fall back to static path */ }
+                                    }
+                                }
+                            }
+                        } catch (e) { /* unreadable/unparsable index.html; fall back to static path */ }
+                    }
+                }
+                if (needsBundling) {
+                    logToConsole('parent', 'info', ['Building as source project: ' + bundlingProbeReason]);
+                    const bundleOk = await buildAndLaunchProject(zip, paths, packageJsonPath, isReload);
+                    if (bundleOk) return;
+                    // Bundling failed -- fall back to treating the zip as a plain static
+                    // site instead of dead-ending on an error screen. Plenty of "false
+                    // positive" source-project detections (or projects with build setups
+                    // esbuild genuinely can't replicate) still contain files that will run
+                    // fine as-is if there's a viable HTML entry point.
+                    logToConsole('parent', 'warn', ['Bundling failed; falling back to static file mode.']);
+                }
+
+                await launchStaticFromZip(zip, paths);
+            }
+
+            // ---------------------------------------------------------------------
+            // Static mode: run the zip's files as-is (no build step), rewriting
+            // relative references to the data: URIs built for every file. Covers
+            // plain HTML/JS/CSS games, and is also used as a fallback when a
+            // source-project build attempt fails.
+            // ---------------------------------------------------------------------
+            async function launchStaticFromZip(zip, paths) {
+                setStatus(`Unpacking ${paths.length} file${paths.length === 1 ? '' : 's'}…`, { spinner: true });
+
+                // Build a data: URI map for every file, keyed by normalized relative path.
+                // We use data: URIs instead of blob: URLs here because this runner page
+                // can itself end up embedded at an opaque ("null") origin (e.g. when
+                // shown inside another sandboxed srcdoc frame, such as an artifact
+                // preview). blob: URLs are permanently tied to the exact origin instance
+                // that created them, so a blob minted by an opaque-origin page can NEVER
+                // be resolved by any other frame/context -- not even a same-page nested
+                // iframe -- which is what caused the "Not allowed to load local
+                // resource: blob:null/..." errors and the black screen. data: URIs have
+                // no origin dependency at all, so they work regardless of what origin
+                // this runner happens to be loaded at.
+                const map = {};
+                try {
+                    for (const path of paths) {
+                        const entry = zip.files[path];
+                        const normPath = path.replace(/^\/+/, '');
+                        const mime = guessMime(normPath);
+                        const isTextLike = /^(text\/|application\/javascript|application\/json|image\/svg\+xml|application\/xml)/.test(mime);
+                        if (isTextLike) {
+                            const text = await entry.async('string');
+                            // Text assets: encode as UTF-8 base64 data URI (safe for any
+                            // characters, unlike encodeURIComponent-based data URIs).
+                            map[normPath] = `data:${mime};base64,${utf8ToBase64(text)}`;
+                        } else {
+                            const base64 = await entry.async('base64');
+                            map[normPath] = `data:${mime};base64,${base64}`;
+                        }
+                    }
+                } catch (err) {
+                    showError('Could not read the contents of this zip.', 'It may use password protection or an unsupported compression method. ' + (err && err.message ? err.message : ''));
+                    return;
+                }
+
+                blobUrlMap = map; // name kept for minimal diff elsewhere; now holds data: URIs
+
+                htmlEntries = Object.keys(map)
+                    .filter(p => /\.html?$/i.test(p))
+                    .sort((a, b) => a.split('/').length - b.split('/').length || a.length - b.length);
+
+                if (htmlEntries.length === 0) {
+                    showError('No .html file found in this zip.', 'The zip should contain an index.html (or another .html file) plus any .js files your game needs.');
+                    return;
+                }
+
+                // Populate entry picker
+                entryPicker.innerHTML = '';
+                htmlEntries.forEach(p => {
+                    const opt = document.createElement('option');
+                    opt.value = p;
+                    opt.textContent = p;
+                    entryPicker.appendChild(opt);
+                });
+
+                // Prefer the shallowest index.html (handles games nested inside a
+                // top-level folder, e.g. MyGame/index.html, as well as root index.html)
+                let defaultEntry =
+                    htmlEntries.find(p => p.toLowerCase() === 'index.html') ||
+                    htmlEntries
+                        .filter(p => p.toLowerCase().endsWith('/index.html'))
+                        .sort((a, b) => a.split('/').length - b.split('/').length)[0] ||
+                    htmlEntries[0];
+
+                entryPicker.value = defaultEntry;
+                entryPicker.style.display = htmlEntries.length > 1 ? 'inline-block' : 'none';
+                reloadBtn.style.display = 'inline-block';
+                loadAnotherBtn.style.display = 'inline-block';
+                fullscreenBtn.style.display = 'inline-block';
+
+                launchEntry(defaultEntry);
+            }
+
+            // ---------------------------------------------------------------------
+            // Project mode: React/Vite/TypeScript (or similar) source projects.
+            // Bundles the source in-browser with esbuild-wasm, resolving relative
+            // imports against the zip's own files and bare package imports (react,
+            // three, etc.) against the esm.sh CDN. Detects Tailwind usage and runs
+            // it through the Tailwind standalone browser build if present.
+            // ---------------------------------------------------------------------
+
+            async function buildAndLaunchProject(zip, paths, packageJsonPath, isReload) {
+                if (dropzone.parentNode) dropzone.parentNode.removeChild(dropzone);
+                if (document.fullscreenElement === currentFrameWrapper) document.exitFullscreen().catch(() => { });
+                stage.innerHTML = '';
+                currentFrame = null;
+                currentFrameWrapper = null;
+                fpsOverlayEl = null;
+
+                setStatus('Detected a source project (package.json found) — preparing build…', { spinner: true });
+
+                const projectRoot = packageJsonPath.includes('/') ? packageJsonPath.slice(0, packageJsonPath.lastIndexOf('/') + 1) : '';
+
+                // Read every file as text (source projects are code/text; binary assets
+                // like images are handled separately via data: URIs for esbuild's file
+                // loader). We use data: URIs rather than blob: URLs here for the same
+                // reason as in launchEntry(): this runner page can itself be embedded at
+                // an opaque origin, and blob: URLs it mints in that case are unusable
+                // from any other context (including nested iframes), whereas data: URIs
+                // have no origin dependency at all.
+                const TEXT_EXT = /\.(json|js|jsx|ts|tsx|mjs|cjs|css|html|txt|md|svg)$/i;
+                const files = {}; // path (relative to projectRoot) -> string content
+                const binaryBlobUrls = {}; // path -> data: URI, for images/fonts/etc. (name kept for minimal diff)
+
+                try {
+                    for (const p of paths) {
+                        if (!p.startsWith(projectRoot)) continue; // ignore files outside the project root, if any
+                        const rel = p.slice(projectRoot.length);
+                        if (!rel || zip.files[p].dir) continue;
+                        // skip heavy/irrelevant dirs that don't belong in a browser build
+                        if (/^(node_modules|\.git|dist|build)\//i.test(rel)) continue;
+
+                        if (TEXT_EXT.test(rel)) {
+                            files[rel] = await zip.files[p].async('string');
+                        } else {
+                            const mime = guessMime(rel);
+                            const base64 = await zip.files[p].async('base64');
+                            binaryBlobUrls[rel] = `data:${mime};base64,${base64}`;
+                        }
+                    }
+                } catch (err) {
+                    showError('Could not read the project files.', 'The zip may use password protection or an unsupported compression method. ' + (err && err.message ? err.message : ''));
+                    return false;
+                }
+
+                let pkg = {};
+                try {
+                    pkg = JSON.parse(files['package.json'] || '{}');
+                } catch (e) {
+                    showError('Could not parse package.json.', 'The file exists but is not valid JSON.');
+                    return false;
+                }
+
+                const deps = Object.assign({}, pkg.dependencies || {}, pkg.devDependencies || {});
+
+                // Find the HTML entry: prefer index.html at the project root.
+                const htmlCandidates = Object.keys(files).filter(p => /\.html?$/i.test(p));
+                const entryHtmlPath =
+                    htmlCandidates.find(p => p.toLowerCase() === 'index.html') ||
+                    htmlCandidates.sort((a, b) => a.split('/').length - b.split('/').length)[0];
+
+                if (!entryHtmlPath) {
+                    showError('No index.html found in this project.', 'A source project needs an index.html with a <script type="module" src="..."> entry point.');
+                    return false;
+                }
+
+                let entryHtml = files[entryHtmlPath];
+                const scriptMatch = entryHtml.match(/<script[^>]*\stype\s*=\s*["']module["'][^>]*\ssrc\s*=\s*["']([^"']+)["'][^>]*>/i);
+                if (!scriptMatch) {
+                    // No module entry script found after all -- this isn't actually an
+                    // unbuilt source project. Let the caller fall back to static mode
+                    // rather than dead-ending here.
+                    return false;
+                }
+
+                // Resolve the entry module path relative to the project root (Vite-style
+                // absolute paths like "/src/main.tsx" are root-relative, not filesystem-absolute).
+                let entryModulePath = scriptMatch[1].replace(/^\//, '');
+
+                // Path alias support (e.g. Vite's "@" -> "src", read from vite.config.* or jsconfig/tsconfig if present)
+                const aliasMap = extractPathAliases(files);
+
+                setStatus('Loading build tools…', { spinner: true });
+                try {
+                    await window.__esbuildInitPromise;
+                } catch (err) {
+                    showError('Could not load the in-browser build tools.', 'esbuild-wasm failed to initialize. Check your network connection and try again. ' + (err && err.message ? err.message : ''));
+                    return false;
+                }
+                const esbuild = window.__esbuild;
+
+                // ---- esbuild plugin: resolve relative + aliased imports against the
+                // in-memory file map, and bare package imports against esm.sh ----
+                const extsToTry = ['', '.tsx', '.ts', '.jsx', '.js', '.mjs', '/index.tsx', '/index.ts', '/index.jsx', '/index.js'];
+
+                function normalizeRel(fromDir, spec) {
+                    let clean = spec;
+                    let base = fromDir;
+                    if (clean.startsWith('/')) { clean = clean.slice(1); base = ''; }
+                    const combined = (base + clean).split('/');
+                    const stack = [];
+                    for (const part of combined) {
+                        if (part === '..') stack.pop();
+                        else if (part === '.' || part === '') continue;
+                        else stack.push(part);
+                    }
+                    return stack.join('/');
+                }
+
+                function findLocalFile(candidatePath) {
+                    for (const ext of extsToTry) {
+                        const tryPath = candidatePath + ext;
+                        if (files[tryPath] !== undefined) return tryPath;
+                        if (binaryBlobUrls[tryPath] !== undefined) return tryPath;
+                    }
+                    return null;
+                }
+
+                const CDN_BASE = 'https://esm.sh/';
+
+                // Pin shared deps (react/react-dom are the classic case: if a third package
+                // internally imports react too, esm.sh needs to know to reuse *our* pinned
+                // version rather than fetching its own copy, or hooks break with a
+                // "multiple React instances" error).
+                const sharedDepsQuery = ['react', 'react-dom']
+                    .filter(name => deps[name])
+                    .map(name => `${name}@${deps[name].replace(/^[\^~]/, '')}`)
+                    .join(',');
+
+                function cdnUrlFor(pkgName) {
+                    const version = deps[pkgName];
+                    const base = version ? `${CDN_BASE}${pkgName}@${version.replace(/^[\^~]/, '')}` : `${CDN_BASE}${pkgName}`;
+                    const isReactFamily = pkgName === 'react' || pkgName === 'react-dom';
+                    if (sharedDepsQuery && !isReactFamily) {
+                        return `${base}?deps=${sharedDepsQuery}`;
+                    }
+                    return base;
+                }
+
+                // Builds the full CDN URL for a possibly-subpathed specifier (e.g. "react-dom/client"),
+                // inserting the subpath before any ?query string rather than after it.
+                function cdnUrlForSpecifier(spec, pkgName) {
+                    const subpath = spec.slice(pkgName.length); // e.g. "/client" or ""
+                    const url = cdnUrlFor(pkgName);
+                    const qIndex = url.indexOf('?');
+                    if (qIndex === -1) return url + subpath;
+                    return url.slice(0, qIndex) + subpath + url.slice(qIndex);
+                }
+
+                const localResolverPlugin = {
+                    name: 'local-resolver',
+                    setup(build) {
+                        // The entry point itself (e.g. "src/main.tsx") is resolved by esbuild
+                        // directly, not routed through the relative-import filter below, since
+                        // it has no "./" prefix. Intercept it explicitly via args.kind.
+                        build.onResolve({ filter: /.*/ }, args => {
+                            if (args.kind !== 'entry-point') return undefined; // let other resolvers handle it
+                            const found = findLocalFile(args.path);
+                            if (!found) return { errors: [{ text: `Could not find entry point "${args.path}" in the project.` }] };
+                            return { path: found, namespace: 'local-file' };
+                        });
+
+                        // Entry point and relative imports ("./x", "../x", "@/x")
+                        build.onResolve({ filter: /^\.\.?\// }, args => {
+                            const fromDir = args.importer ? args.importer.slice(0, args.importer.lastIndexOf('/') + 1) : '';
+                            const candidate = normalizeRel(fromDir, args.path);
+                            const found = findLocalFile(candidate);
+                            if (!found) return { errors: [{ text: `Could not resolve "${args.path}" from "${args.importer}"` }] };
+                            if (binaryBlobUrls[found] !== undefined) {
+                                return { path: found, namespace: 'local-binary' };
+                            }
+                            return { path: found, namespace: 'local-file' };
+                        });
+
+                        // Alias imports (e.g. "@/components/Foo")
+                        for (const alias of Object.keys(aliasMap)) {
+                            const prefix = alias.endsWith('/*') ? alias.slice(0, -2) : alias;
+                            const re = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(/|$)');
+                            build.onResolve({ filter: re }, args => {
+                                const rest = args.path.slice(prefix.length).replace(/^\//, '');
+                                const target = aliasMap[alias].replace(/\/\*$/, '');
+                                const candidate = target ? `${target}/${rest}`.replace(/\/$/, '') : rest;
+                                const found = findLocalFile(candidate);
+                                if (!found) return { errors: [{ text: `Could not resolve alias "${args.path}" -> "${candidate}"` }] };
+                                if (binaryBlobUrls[found] !== undefined) return { path: found, namespace: 'local-binary' };
+                                return { path: found, namespace: 'local-file' };
+                            });
+                        }
+
+                        build.onLoad({ filter: /.*/, namespace: 'local-file' }, args => {
+                            let content = files[args.path];
+                            const ext = (args.path.match(/\.([a-z0-9]+)$/i) || [, 'js'])[1].toLowerCase();
+                            const loaderMap = { ts: 'ts', tsx: 'tsx', js: 'jsx', jsx: 'jsx', mjs: 'js', cjs: 'js', css: 'css', json: 'json', svg: 'text', txt: 'text', md: 'text' };
+                            if (ext === 'css') {
+                                // Strip Tailwind's @import "tailwindcss" / @tailwind directives:
+                                // these aren't resolvable local files, and Tailwind compilation
+                                // happens separately at runtime via @tailwindcss/browser in the
+                                // launched iframe (see usesTailwind below), not through esbuild.
+                                content = content
+                                    .replace(/@import\s+["']tailwindcss["'][^;]*;?/gi, '')
+                                    .replace(/@tailwind\s+(base|components|utilities)\s*;?/gi, '');
+                            }
+                            return { contents: content, loader: loaderMap[ext] || 'text', resolveDir: args.path.includes('/') ? args.path.slice(0, args.path.lastIndexOf('/')) : '' };
+                        });
+
+                        // Binary assets (images, fonts, etc.): expose the blob URL as the
+                        // module's default export, matching how bundlers like Vite handle
+                        // `import img from './photo.png'`.
+                        build.onLoad({ filter: /.*/, namespace: 'local-binary' }, args => {
+                            return { contents: `export default ${JSON.stringify(binaryBlobUrls[args.path])};`, loader: 'js' };
+                        });
+
+                        // Bare package imports (react, three, clsx, ...) are left external —
+                        // NOT bundled — so the browser resolves them at runtime via the
+                        // <script type="importmap"> we generate below. This keeps each
+                        // package as a single shared instance across the whole page.
+                        build.onResolve({ filter: /^[a-zA-Z0-9@][^:]*$/ }, args => {
+                            return { path: args.path, external: true };
+                        });
+                    }
+                };
+
+                setStatus(`Bundling ${entryModulePath}…`, { spinner: true });
+
+                let bundleResult;
+                try {
+                    bundleResult = await esbuild.build({
+                        entryPoints: [entryModulePath],
+                        bundle: true,
+                        write: false,
+                        // esbuild needs an output path to split CSS files imported from JS
+                        // (e.g. "import './index.css'") into a sibling CSS output file. This
+                        // never actually writes to disk since write:false is set above --
+                        // outdir just gives esbuild a naming/splitting anchor, and we read
+                        // the results back from bundleResult.outputFiles below.
+                        outdir: 'dist',
+                        format: 'esm',
+                        target: 'es2020',
+                        jsx: 'automatic',
+                        loader: { '.js': 'jsx' },
+                        plugins: [localResolverPlugin],
+                        logLevel: 'silent'
+                    });
+                } catch (err) {
+                    const msg = (err && err.message) ? err.message : String(err);
+                    // Don't dead-end here: this can happen with build setups esbuild can't
+                    // replicate (custom plugins, non-standard configs, an entry that's
+                    // actually already-compiled output rather than resolvable source).
+                    // Log it for visibility and let the caller retry in static mode, which
+                    // covers the common case where the game runs fine unbundled.
+                    logToConsole('parent', 'warn', ['esbuild compile failed (' + msg + '); will retry as a static file set.']);
+                    return false;
+                }
+
+                // Separate JS and CSS output files
+                let jsOutput = '';
+                let cssOutput = '';
+                for (const out of bundleResult.outputFiles) {
+                    if (out.path.endsWith('.css')) cssOutput += out.text;
+                    else jsOutput += out.text;
+                }
+
+                // ---- Tailwind detection ----
+                // If the project uses Tailwind (v4 "@import tailwindcss" or v3 "@tailwind" directives),
+                // we can't run Tailwind's Node-based build in-browser easily. Instead we ship the
+                // @tailwindcss/browser runtime into the launched iframe: it scans the live DOM/CSS
+                // there and generates utility classes on the fly. It only supports Tailwind v4 syntax.
+                // (Checked against the original unstripped file contents, since the esbuild CSS
+                // loader above already stripped these directives out of cssOutput.)
+                const TAILWIND_MARKER_RE = /@import\s+["']tailwindcss["']|@tailwind\s+(base|components|utilities)/;
+                const usesTailwind = Object.values(files).some(t => TAILWIND_MARKER_RE.test(t));
+
+                // ---- Build the import map for CDN-resolved bare packages ----
+                const importMapEntries = {};
+                function collectBareSpecifiers(code) {
+                    const re = /(?:from\s+|import\s*\(\s*)["']([^"'.][^"']*)["']/g;
+                    let m;
+                    while ((m = re.exec(code))) importMapEntries[m[1]] = true;
+                }
+                collectBareSpecifiers(jsOutput);
+                const importMap = { imports: {} };
+                Object.keys(importMapEntries).forEach(spec => {
+                    const pkgName = spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0];
+                    importMap.imports[spec] = spec === pkgName ? cdnUrlFor(pkgName) : cdnUrlForSpecifier(spec, pkgName);
+                });
+
+                // ---- Assemble final HTML ----
+                // The compiled JS is put into a data: URI and referenced with src="..."
+                // rather than inlined as text, avoiding any risk of it corrupting the
+                // surrounding JS template literal (e.g. if it happened to contain a
+                // backtick or "${" sequence). data: URIs are used instead of blob: URLs
+                // because this runner page can itself be embedded at an opaque origin
+                // (see notes elsewhere), which makes any blob: URL it creates unusable
+                // from a nested iframe -- data: URIs have no such origin dependency.
+                const jsBlobUrl = `data:application/javascript;base64,${utf8ToBase64(jsOutput)}`;
+
+                const tailwindTag = usesTailwind
+                    ? '<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"><\/script>\n'
+                    : '';
+
+                // @tailwindcss/browser only compiles <style type="text/tailwindcss"> blocks
+                // (it needs the raw @theme/@import text inline, not a linked stylesheet),
+                // so we can't use a <link> for Tailwind projects. We build this as
+                // inline HTML text (rather than reaching into the iframe post-load to
+                // set textContent) since it's simpler and works the same either way.
+                // This is safe against both failure modes: html-escaping neutralizes any
+                // closing style-tag sequence, and because this is a separate string (built with
+                // simple concatenation, not embedded inside a template literal that also
+                // contains other interpolations), a stray backtick in the CSS can't
+                // corrupt anything since it's never placed inside a template literal itself.
+                function escapeForHtmlText(s) {
+                    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                }
+
+                let styleOrLinkTag;
+                if (usesTailwind) {
+                    styleOrLinkTag = '<style type="text/tailwindcss">' + escapeForHtmlText(cssOutput) + '</' + 'style>';
+                } else {
+                    const cssBlobUrl = `data:text/css;base64,${utf8ToBase64(cssOutput)}`;
+                    styleOrLinkTag = '<link rel="stylesheet" href="' + cssBlobUrl + '">';
+                }
+
+                // JSON.stringify does not escape closing script-tag sequences, and
+                // importMap values are partly derived from package.json's dependency
+                // version strings (untrusted content from the uploaded zip), so guard
+                // against a crafted version string breaking out of the import map tag.
+                const importMapJson = JSON.stringify(importMap).replace(/<\/script/gi, '<\\/script');
+
+                const injectedBlock = tailwindTag +
+                    '<script type="importmap">' + importMapJson + '<\/script>\n' +
+                    styleOrLinkTag + '\n' +
+                    '<script type="module" src="' + jsBlobUrl + '"><\/script>';
+
+                let finalHtml = entryHtml.replace(
+                    /<script[^>]*\stype\s*=\s*["']module["'][^>]*\ssrc\s*=\s*["'][^"']+["'][^>]*>\s*<\/script>/i,
+                    () => injectedBlock // function form: avoids "$"-pattern special replacement handling on the replaced text
+                );
+
+                // Resolve any remaining static asset references in the HTML itself (e.g. <link rel="icon">, images in public/)
+                const publicMap = {};
+                Object.keys(binaryBlobUrls).forEach(p => { publicMap[p.replace(/^public\//, '')] = binaryBlobUrls[p]; publicMap[p] = binaryBlobUrls[p]; });
+                finalHtml = finalHtml.replace(/(\s(?:src|href)\s*=\s*)(["'])(.*?)\2/gi, (match, prefix, quote, val) => {
+                    if (/^([a-z][a-z0-9+.-]*:)?\/\//i.test(val) || val.startsWith('data:') || val.startsWith('blob:') || val.startsWith('#')) return match;
+                    const clean = val.replace(/^\.?\//, '');
+                    const resolved = publicMap[clean];
+                    return resolved ? `${prefix}${quote}${resolved}${quote}` : match;
+                });
+
+                // Inject the debug-forwarding shim and the GPU/toggle settings shim as
+                // early as possible so both are active before the game's own (compiled)
+                // scripts run.
+                const injectedShims = debugShim + buildSettingsShim(settings.gpu, settings.toggles);
+                if (/<head[^>]*>/i.test(finalHtml)) {
+                    finalHtml = finalHtml.replace(/<head[^>]*>/i, m => m + injectedShims);
+                } else {
+                    finalHtml = injectedShims + finalHtml;
+                }
+
+                const iframe = document.createElement('iframe');
+                iframe.className = 'game-frame';
+                // All references inside finalHtml (compiled JS, CSS, binary assets) are
+                // data: URIs, which carry their content inline with no origin
+                // dependency -- so plain srcdoc works here regardless of what origin
+                // this runner page itself happens to be loaded at.
+                // allow-same-origin: for a srcdoc iframe this makes the game same-origin
+                // with THIS runner page (not cross-origin with some external site), which
+                // is what gives it a stable, real origin -- required for localStorage/
+                // indexedDB to work at all, and to persist across reloads (without it,
+                // the frame gets a fresh unique/opaque origin every load and storage is
+                // blocked outright).
+                // allow-fullscreen: required for the Fullscreen API to work from inside
+                // the iframe.
+                iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-pointer-lock allow-forms allow-modals allow-popups allow-fullscreen');
+                iframe.setAttribute('allowfullscreen', 'true');
+                iframe.srcdoc = finalHtml;
+                iframe.addEventListener('load', () => {
+                    setStatus(`Running ${entryHtmlPath} (built from source)`, { right: `${Object.keys(files).length + Object.keys(binaryBlobUrls).length} project files` });
+                    applyLiveToggles();
+                });
+
+                mountGameFrame(iframe);
+
+                reloadBtn.style.display = 'inline-block';
+                loadAnotherBtn.style.display = 'inline-block';
+                fullscreenBtn.style.display = 'inline-block';
+                entryPicker.style.display = 'none';
+                return true;
+            }
+
+            // Extracts a simple alias map ("@": "src") from vite.config.*, tsconfig.json, or jsconfig.json if present.
+            function stripJsonComments(text) {
+                // Strips // line comments and /* */ block comments from JSONC (tsconfig.json
+                // style files), while leaving comment-like sequences inside string literals
+                // alone. Also removes trailing commas, which tsconfig.json commonly has.
+                let out = '';
+                let inString = false;
+                let stringChar = '';
+                for (let i = 0; i < text.length; i++) {
+                    const c = text[i];
+                    const next = text[i + 1];
+                    if (inString) {
+                        out += c;
+                        if (c === '\\') { out += next; i++; continue; }
+                        if (c === stringChar) inString = false;
+                        continue;
+                    }
+                    if (c === '"' || c === "'") { inString = true; stringChar = c; out += c; continue; }
+                    if (c === '/' && next === '/') { while (i < text.length && text[i] !== '\n') i++; out += '\n'; continue; }
+                    if (c === '/' && next === '*') { i += 2; while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++; i++; continue; }
+                    out += c;
+                }
+                return out.replace(/,(\s*[}\]])/g, '$1');
+            }
+
+            function extractPathAliases(files) {
+                const aliasMap = {};
+                for (const key of Object.keys(files)) {
+                    if (/^(tsconfig|jsconfig)(\..*)?\.json$/i.test(key.split('/').pop())) {
+                        try {
+                            const cleaned = stripJsonComments(files[key]);
+                            const json = JSON.parse(cleaned);
+                            const paths = json.compilerOptions && json.compilerOptions.paths;
+                            const baseUrl = (json.compilerOptions && json.compilerOptions.baseUrl) || '.';
+                            if (paths) {
+                                Object.keys(paths).forEach(k => {
+                                    const target = paths[k][0];
+                                    const normBase = baseUrl === '.' ? '' : baseUrl.replace(/\/$/, '') + '/';
+                                    aliasMap[k] = (normBase + target).replace(/^\.\//, '');
+                                });
+                            }
+                        } catch (e) { /* ignore unparsable config */ }
+                    }
+                }
+                // Fallback: common Vite convention if nothing else found
+                if (Object.keys(aliasMap).length === 0) {
+                    const hasSrc = Object.keys(files).some(f => f.startsWith('src/'));
+                    if (hasSrc) aliasMap['@/*'] = 'src/*';
+                }
+                return aliasMap;
+            }
+
+            // Note: Tailwind compilation happens inside the launched iframe itself (see
+            // buildAndLaunchProject), by injecting the @tailwindcss/browser script there
+            // alongside the project's own CSS, since that package compiles by scanning
+            // the live DOM/stylesheets of the page it's loaded into.
+
+            async function launchEntry(entryPath) {
+                if (dropzone.parentNode) dropzone.parentNode.removeChild(dropzone);
+                if (currentFrame) unmountGameFrame();
+
+                setStatus(`Launching ${entryPath}…`, { spinner: true });
+
+                // Rewrite relative references to the data: URIs we already built for
+                // every file in the zip, then load the whole thing via srcdoc. We use
+                // srcdoc + data: URIs rather than blob: URLs here: this runner page can
+                // itself be embedded at an opaque ("null") origin (e.g. inside another
+                // sandboxed preview frame), and blob: URLs it creates are only ever
+                // resolvable from that exact same origin instance -- not even a nested
+                // same-page iframe can load them in that situation. data: URIs carry
+                // their content inline and have no origin dependency, so they always work.
+
+                try {
+                    let html = dataUriToText(blobUrlMap[entryPath]);
+
+                    const entryDir = entryPath.includes('/') ? entryPath.slice(0, entryPath.lastIndexOf('/') + 1) : '';
+
+                    // Generic path resolver: takes a "current directory" and a relative
+                    // reference, walks '..'/'.' segments, and looks the result up in the
+                    // flat blobUrlMap. Works for any nesting depth.
+                    function resolveFrom(baseDir, relPath) {
+                        if (/^([a-z][a-z0-9+.-]*:)?\/\//i.test(relPath) || relPath.startsWith('data:') || relPath.startsWith('blob:') || relPath.startsWith('#')) {
+                            return null;
+                        }
+                        let clean = relPath.split('#')[0].split('?')[0];
+                        const wasRootAbsolute = clean.startsWith('/');
+                        if (wasRootAbsolute) clean = clean.slice(1);
+                        clean = clean.replace(/^\.\//, '');
+
+                        // Root-absolute URLs in uploaded games are usually relative to the
+                        // game's web root. If the zip has a single top-level folder (e.g.
+                        // MyGame/index.html + MyGame/vendor/...), the game's web root is the
+                        // entry HTML folder, not the physical zip root. Try both so imports
+                        // like /vendor/... work in either zip layout.
+                        const candidateBases = wasRootAbsolute
+                            ? ['', entryDir]
+                            : [baseDir];
+
+                        for (const base of candidateBases) {
+                            const combined = (base + clean).split('/');
+                            const stack = [];
+                            for (const part of combined) {
+                                if (part === '..') stack.pop();
+                                else if (part === '.' || part === '') continue;
+                                else stack.push(part);
+                            }
+                            const finalPath = stack.join('/');
+                            if (blobUrlMap[finalPath]) return blobUrlMap[finalPath];
+                        }
+                        return null;
+                    }
+
+                    function resolveLocal(relPath) {
+                        return resolveFrom(entryDir, relPath);
+                    }
+
+                    // Rewrite url(...) references inside a CSS text block (used both for
+                    // linked .css files and inline <style> blocks), relative to cssDir.
+                    function rewriteCssUrls(cssText, cssDir) {
+                        return cssText.replace(/url\(\s*(["']?)(.*?)\1\s*\)/gi, (match, quote, val) => {
+                            const resolved = resolveFrom(cssDir, val.trim());
+                            return resolved ? `url(${quote}${resolved}${quote})` : match;
+                        });
+                    }
+
+                    // Rewrite src="" and href="" for local files we have in the map,
+                    // and for linked stylesheets, fetch + rewrite their internal url()s too.
+                    const cssRewritePromises = [];
+                    html = html.replace(/(<link\b[^>]*?\srel\s*=\s*["']stylesheet["'][^>]*?\shref\s*=\s*["'])(.*?)(["'][^>]*>)/gi, (match, prefix, val, suffix) => {
+                        const resolved = resolveLocal(val);
+                        if (!resolved) return match;
+                        const placeholder = `__CSS_PLACEHOLDER_${cssRewritePromises.length}__`;
+                        cssRewritePromises.push((async () => {
+                            try {
+                                const cssDir = val.includes('/')
+                                    ? (val.startsWith('/') ? val.slice(1, val.lastIndexOf('/') + 1) : entryDir + val.slice(0, val.lastIndexOf('/') + 1))
+                                    : entryDir;
+                                const cssText = dataUriToText(resolved);
+                                const rewritten = rewriteCssUrls(cssText, cssDir);
+                                return `data:text/css;base64,${utf8ToBase64(rewritten)}`;
+                            } catch (e) {
+                                return resolved; // fall back to unrewritten stylesheet
+                            }
+                        })());
+                        return `${prefix}${placeholder}${suffix}`;
+                    });
+
+                    const cssResolved = await Promise.all(cssRewritePromises);
+                    cssResolved.forEach((url, i) => {
+                        html = html.replace(`__CSS_PLACEHOLDER_${i}__`, url);
+                    });
+
+                    // Rewrite inline <style> blocks' url() references too
+                    html = html.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi, (match, open, css, close) => {
+                        return open + rewriteCssUrls(css, entryDir) + close;
+                    });
+
+                    // Rewrite remaining src="" / href="" attributes (scripts, images, etc.)
+                    html = html.replace(/(\s(?:src|href)\s*=\s*)(["'])(.*?)\2/gi, (match, prefix, quote, val) => {
+                        const resolved = resolveLocal(val);
+                        return resolved ? `${prefix}${quote}${resolved}${quote}` : match;
+                    });
+
+                    // ---- Native ES module support ----
+                    // A <script type="module" src="app.js"> now points at a data: URI (from
+                    // the rewrite above), so the module itself loads fine. But its base URL
+                    // when executed under srcdoc is "about:srcdoc", which has no real path
+                    // -- so any `import ... from './x.js'` INSIDE that module (or inside
+                    // whatever it imports, recursively) can't resolve at all ("Failed to
+                    // resolve module specifier" / "Invalid relative url"). Browsers give
+                    // native ES modules no hook to intercept resolution (unlike fetch/XHR,
+                    // which we shim at runtime), so the only fix is to rewrite import
+                    // specifiers to data: URIs ourselves, ahead of time, before the module
+                    // ever reaches the browser -- recursively, since imported files can
+                    // themselves import further relative files.
+                    //
+                    // Bare specifiers (e.g. "import x from 'libsodium'") are left alone:
+                    // those are handled by the page's own <script type="importmap"> (or
+                    // will simply fail the same way they would outside this runner if
+                    // there's no import map, which is correct/expected behavior to preserve).
+                    const jsDataUriCache = {}; // original blob-map path -> rewritten data: URI, avoids re-rewriting shared imports
+                    function rewriteJsImports(jsPath, jsText) {
+                        const jsDir = jsPath.includes('/') ? jsPath.slice(0, jsPath.lastIndexOf('/')) : '';
+
+                        // First pass: structured static imports/exports and simple dynamic
+                        // import('./x.js') calls.
+                        let rewritten = jsText.replace(
+                            // Handles:
+                            //   import './side-effect.js'
+                            //   import x from './x.js'
+                            //   import { x } from './x.js'
+                            //   export { x } from './x.js'
+                            //   export * from './x.js'
+                            //   import('./x.js')
+                            //   import '/vendor/pkg/module.mjs'   (zip-root absolute local paths)
+                            // This is needed because modules loaded from data: URIs / srcdoc
+                            // cannot resolve relative specifiers by themselves: their base URL
+                            // is non-hierarchical, so browsers throw "Invalid relative url or
+                            // base scheme isn't hierarchical" unless we rewrite every local
+                            // relative module specifier to an absolute data: URI ahead of time.
+                            /(\bimport\s*(?:\(\s*)?|\bimport\s+(?:[^'";()]+?\sfrom\s+)?|\bexport\s+(?:[^'";()]+?\sfrom\s+)?)\s*(["'])([./][^"']*)\2/g,
+                            (match, keyword, quote, spec) => {
+                                const resolvedPath = resolveModuleSpecifierPath(jsDir, spec);
+                                if (!resolvedPath) return match; // couldn't find it locally; leave as-is
+                                const dataUri = rewriteJsFileToDataUri(resolvedPath);
+                                return dataUri ? `${keyword}${quote}${dataUri}${quote}` : match;
+                            }
+                        );
+
+                        // Second pass: rewrite any remaining quoted local JS/MJS module paths
+                        // anywhere in the script. This covers real-world patterns used by
+                        // messaging/crypto apps such as:
+                        //   import(/* webpackIgnore: true */ '/vendor/libsodium-wrappers/libsodium-wrappers.mjs')
+                        //   const sodiumUrl = '/vendor/libsodium-wrappers/libsodium-wrappers.mjs';
+                        //   await import(sodiumUrl);
+                        // Native dynamic import() cannot be monkey-patched at runtime, so the
+                        // safest browser-only compatibility fix is to turn those local module
+                        // path strings into absolute data: module URLs before the app runs.
+                        rewritten = rewritten.replace(/(["'])([./][^"']*\.m?js(?:[?#][^"']*)?)\1/g, (match, quote, spec) => {
+                            const resolvedPath = resolveModuleSpecifierPath(jsDir, spec);
+                            if (!resolvedPath) return match;
+                            const dataUri = rewriteJsFileToDataUri(resolvedPath);
+                            return dataUri ? `${quote}${dataUri}${quote}` : match;
+                        });
+
+                        return rewritten;
+                    }
+
+                    // Like resolveFrom, but returns the flat path string (not the data: URI)
+                    // so we can recurse into that file's own imports before wrapping it.
+                    function resolveModuleSpecifierPath(baseDir, relPath) {
+                        let clean = relPath.split('#')[0].split('?')[0];
+                        const wasRootAbsolute = clean.startsWith('/');
+                        if (wasRootAbsolute) clean = clean.slice(1);
+                        clean = clean.replace(/^\.\//, '');
+
+                        // For root-absolute module specifiers, try both the physical zip root
+                        // and the launched HTML's folder as the web root. This covers zips
+                        // wrapped in a top-level folder, where /vendor/x.mjs should resolve to
+                        // MyGame/vendor/x.mjs rather than vendor/x.mjs.
+                        const candidateBases = wasRootAbsolute
+                            ? ['', entryDir]
+                            : [baseDir + (baseDir ? '/' : '')];
+
+                        for (const base of candidateBases) {
+                            const combined = (base + clean).split('/');
+                            const stack = [];
+                            for (const part of combined) {
+                                if (part === '..') stack.pop();
+                                else if (part === '.' || part === '') continue;
+                                else stack.push(part);
+                            }
+                            const finalPath = stack.join('/');
+                            if (blobUrlMap[finalPath] !== undefined) return finalPath;
+                        }
+                        return null;
+                    }
+
+                    function rewriteJsFileToDataUri(jsPath) {
+                        if (jsDataUriCache[jsPath]) return jsDataUriCache[jsPath];
+                        if (!/\.m?js$/i.test(jsPath)) {
+                            // Non-JS import target (e.g. a JSON module or asset) -- just point
+                            // at its existing data: URI unchanged, no import-rewriting needed.
+                            return blobUrlMap[jsPath] || null;
+                        }
+                        // Placeholder first, in case of a circular import graph.
+                        jsDataUriCache[jsPath] = blobUrlMap[jsPath];
+                        const src = dataUriToText(blobUrlMap[jsPath]);
+                        const rewritten = rewriteJsImports(jsPath, src);
+                        const finalUri = `data:text/javascript;base64,${utf8ToBase64(rewritten)}`;
+                        jsDataUriCache[jsPath] = finalUri;
+                        return finalUri;
+                    }
+
+                    // Apply import-rewriting to every local JavaScript <script src="...">,
+                    // not only type="module" scripts. Some apps load a classic script first
+                    // and then call dynamic import('/vendor/...') from inside it; that fails
+                    // under srcdoc/data: for the same base-URL reason, so those classic JS
+                    // files need the same pre-rewrite pass too.
+                    html = html.replace(/<script\b([^>]*)>/gi, (match, attrs) => {
+                        const srcMatch = attrs.match(/\ssrc\s*=\s*["'](.*?)["']/i);
+                        if (!srcMatch) return match; // inline script; handled below
+                        const currentUri = srcMatch[1];
+                        // currentUri is already a data: URI at this point (rewritten above);
+                        // find its original flat path back in blobUrlMap so we can re-derive
+                        // and rewrite it with import-aware content.
+                        const originalPath = Object.keys(blobUrlMap).find(p => blobUrlMap[p] === currentUri);
+                        if (!originalPath || !/\.m?js$/i.test(originalPath)) return match;
+                        const newUri = rewriteJsFileToDataUri(originalPath);
+                        return newUri ? match.replace(currentUri, newUri) : match;
+                    });
+
+                    // Also rewrite import specifiers inside inline script blocks (module and
+                    // classic). This mainly covers dynamic import('/local/module.js') calls.
+                    html = html.replace(/(<script\b[^>]*>)([\s\S]*?)(<\/script>)/gi, (match, open, code, close) => {
+                        if (/\ssrc\s*=/i.test(open)) return match; // handled above
+                        if (/\stype\s*=\s*["'](?:application\/json|application\/ld\+json|importmap)["']/i.test(open)) return match;
+                        return open + rewriteJsImports(entryDir.replace(/\/$/, ''), code) + close;
+                    });
+
+                    // Build an asset resolver map (relative to entryDir) for a runtime fetch/XHR shim,
+                    // so scripts that fetch() JSON/images by relative path still work.
+                    const assetMapForShim = {};
+                    Object.keys(blobUrlMap).forEach(p => { assetMapForShim[p] = blobUrlMap[p]; });
+
+                    const shim = `
+<script>
+(function(){
+          var ASSETS = ${JSON.stringify(assetMapForShim)};
+          var BASE_DIR = ${JSON.stringify(entryDir)};
+          function resolve(url) {
+            try {
+              if (typeof url !== 'string') return url;
+              if (url.startsWith('data:') || url.startsWith('blob:')) return url;
+              // Some libraries (e.g. three.js's GLTFLoader/LoaderUtils) resolve a
+              // relative path against document.baseURI *before* calling fetch, so by
+              // the time we see it here it's already an absolute URL pointing at this
+              // runner's own origin (since srcdoc iframes inherit the parent's
+              // baseURI). Unwrap same-origin absolute URLs back into a plain path so
+              // they can still be matched against ASSETS below, instead of letting
+              // them fall through to the real network (which 404s / returns HTML).
+              if (/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) {
+                try {
+                  var u = new URL(url);
+                  if (u.origin === location.origin) {
+                    url = u.pathname + u.search + u.hash;
+                  } else {
+                    return url; // genuinely cross-origin (e.g. unpkg.com) -- leave alone
+                  }
+                } catch (e) { return url; }
+              } else if (/^\/\//.test(url)) {
+                return url; // protocol-relative cross-origin URL
+              }
+              var clean = url.split('#')[0].split('?')[0];
+              var wasRootAbsolute = clean.startsWith('/');
+              if (wasRootAbsolute) clean = clean.slice(1);
+              clean = clean.replace(/^\\.\\//, '');
+              var bases = wasRootAbsolute ? ['', BASE_DIR] : [BASE_DIR];
+              for (var b=0;b<bases.length;b++){
+                var parts = (bases[b] + clean).split('/');
+                var stack = [];
+                for (var i=0;i<parts.length;i++){
+                  var part = parts[i];
+                  if (part === '..') stack.pop();
+                  else if (part === '.' || part === '') continue;
+                  else stack.push(part);
+                }
+                var finalPath = stack.join('/');
+                if (ASSETS[finalPath]) return ASSETS[finalPath];
+              }
+              return url;
+            } catch(e) { return url; }
+          }
+          var origFetch = window.fetch;
+          window.fetch = function(input, init) {
+            if (typeof input === 'string') return origFetch(resolve(input), init);
+            return origFetch(input, init);
+          };
+          var origOpen = XMLHttpRequest.prototype.open;
+          XMLHttpRequest.prototype.open = function(method, url) {
+            var args = Array.prototype.slice.call(arguments);
+            args[1] = resolve(url);
+            return origOpen.apply(this, args);
+          };
+})();
+<\/script>${debugShim}${buildSettingsShim(settings.gpu, settings.toggles)}`;
+
+                    if (/<head[^>]*>/i.test(html)) {
+                        html = html.replace(/<head[^>]*>/i, m => m + shim);
+                    } else {
+                        html = shim + html;
+                    }
+
+                    const iframe = document.createElement('iframe');
+                    iframe.className = 'game-frame';
+                    // All asset references inside `html` are data: URIs (see note above),
+                    // which have no origin dependency -- so a plain srcdoc iframe works
+                    // fine here regardless of what origin this runner page itself happens
+                    // to be loaded at.
+                    // allow-same-origin: makes the game same-origin with this runner page
+                    // (standard behavior for a sandboxed srcdoc frame with this flag set),
+                    // giving it a stable origin so localStorage/indexedDB work and persist
+                    // across reloads. Without it the frame gets a fresh unique/opaque
+                    // origin every load and storage APIs are blocked outright.
+                    // allow-fullscreen: required for the Fullscreen API inside the iframe.
+                    iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-pointer-lock allow-forms allow-modals allow-popups allow-fullscreen');
+                    iframe.setAttribute('allowfullscreen', 'true');
+                    iframe.srcdoc = html;
+
+                    iframe.addEventListener('load', () => {
+                        setStatus(`Running ${entryPath}`, { right: `${Object.keys(blobUrlMap).length} files loaded` });
+                        applyLiveToggles();
+                    });
+
+                    mountGameFrame(iframe);
+                } catch (err) {
+                    showError('Failed to launch the game.', err && err.message ? err.message : String(err));
+                }
+            }
+
+            function showError(title, detail) {
+                if (document.fullscreenElement === currentFrameWrapper) document.exitFullscreen().catch(() => { });
+                currentFrame = null;
+                currentFrameWrapper = null;
+                fullscreenBtn.style.display = 'none';
+                stage.innerHTML = '';
+                fpsOverlayEl = null;
+                const panel = document.createElement('div');
+                panel.className = 'error-panel';
+                panel.innerHTML = `
+              <div class="error-card">
+                <h2>${escapeHtml(title)}</h2>
+                <p>${escapeHtml(detail)}</p>
+                <br>
+                <button class="btn btn-primary" id="errRetryBtn">Choose a different .zip</button>
+              </div>`;
+                stage.appendChild(panel);
+                document.getElementById('errRetryBtn').addEventListener('click', () => fileInput.click());
+                setStatus(title, { error: true });
+            }
+
+            // ---- Init ----
+            syncSettingsUI();
+            renderSidebar();
+        })();
+    </script>
+    <script>(function () { function c() { var b = a.contentDocument || (a.contentWindow && a.contentWindow.document); if (b) { var d = b.createElement('script'); d.innerHTML = "window.__CF$cv$params={r:'a21a8880bfefd0f6',t:'MTc4NTE0MzY1OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);"; b.getElementsByTagName('head')[0].appendChild(d) } } if (document.body) { var a = document.createElement('iframe'); a.height = 1; a.width = 1; a.style.position = 'absolute'; a.style.top = 0; a.style.left = 0; a.style.border = 'none'; a.style.visibility = 'hidden'; document.body.appendChild(a); if ('loading' !== document.readyState) c(); else if (window.addEventListener) document.addEventListener('DOMContentLoaded', c); else { var e = document.onreadystatechange || function () { }; document.onreadystatechange = function (b) { e(b); 'loading' !== document.readyState && (document.onreadystatechange = e, c()) } } } })();</script>
+</body>
+</html>
