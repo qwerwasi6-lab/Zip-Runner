@@ -1834,10 +1834,117 @@
                     mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg',
                     woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf',
                     wasm: 'application/wasm',
+                    glb: 'model/gltf-binary', gltf: 'model/gltf+json',
+                    bin: 'application/octet-stream',
                     txt: 'text/plain', xml: 'application/xml',
                     mp4: 'video/mp4', webm: 'video/webm'
                 };
                 return map[ext] || 'application/octet-stream';
+            }
+
+            // Returns an early-injected iframe shim which redirects requests for files
+            // in the uploaded zip to their data: URIs. In particular, three.js creates a
+            // Request object before calling fetch(), so handling only string fetch inputs
+            // is not enough for GLTFLoader/DRACOLoader and results in the runner's HTML
+            // being downloaded and parsed as a GLB/JSON file.
+            function buildAssetResolverShim(assetMap, baseDir) {
+                // Zip filenames are untrusted and this JSON is placed in a script element.
+                const assetJson = JSON.stringify(assetMap).replace(/<\/script/gi, '<\\/script');
+                return `
+<script>
+(function(){
+          var ASSETS = ${assetJson};
+          var BASE_DIR = ${JSON.stringify(baseDir || '')};
+
+          function normalize(path) {
+            var parts = path.split('/');
+            var stack = [];
+            for (var i = 0; i < parts.length; i++) {
+              var part = parts[i];
+              if (part === '..') stack.pop();
+              else if (part !== '.' && part !== '') stack.push(part);
+            }
+            return stack.join('/');
+          }
+
+          function findAsset(path, wasRootAbsolute) {
+            try { path = decodeURIComponent(path); } catch (e) { /* keep encoded path */ }
+            path = path.replace(/^\\/+/, '').replace(/^\\.\\//, '');
+            var candidates = [];
+            function add(candidate) {
+              candidate = normalize(candidate);
+              if (candidate && candidates.indexOf(candidate) === -1) candidates.push(candidate);
+            }
+            add(path);
+            add(BASE_DIR + path);
+
+            // A srcdoc document inherits the runner page's URL. A relative request may
+            // consequently arrive as /folder-containing-the-runner/models/ship.glb.
+            // Strip that inherited document directory and try the zip-relative result.
+            var documentDir = location.pathname.replace(/[^/]*$/, '').replace(/^\\/+|\\/+$/g, '');
+            if (documentDir && (path === documentDir || path.indexOf(documentDir + '/') === 0)) {
+              var withoutDocumentDir = path.slice(documentDir.length).replace(/^\\/+/, '');
+              add(withoutDocumentDir);
+              add(BASE_DIR + withoutDocumentDir);
+            }
+
+            for (var i = 0; i < candidates.length; i++) {
+              if (Object.prototype.hasOwnProperty.call(ASSETS, candidates[i])) return ASSETS[candidates[i]];
+            }
+
+            // Last resort for absolute URLs whose inherited prefix cannot be identified
+            // (for example an embedding preview URL): match a complete path suffix.
+            if (wasRootAbsolute) {
+              var best = '';
+              for (var key in ASSETS) {
+                if (Object.prototype.hasOwnProperty.call(ASSETS, key) &&
+                    (path === key || path.endsWith('/' + key)) && key.length > best.length) best = key;
+              }
+              if (best) return ASSETS[best];
+            }
+            return null;
+          }
+
+          function resolve(value) {
+            try {
+              var url = value instanceof URL ? value.href : String(value);
+              if (url.startsWith('data:') || url.startsWith('blob:')) return url;
+              var wasAbsolute = /^[a-z][a-z0-9+.-]*:\\/\\//i.test(url);
+              if (wasAbsolute) {
+                var parsed = new URL(url);
+                if (parsed.origin !== location.origin) return url;
+                url = parsed.pathname + parsed.search + parsed.hash;
+              } else if (/^\\/\\//.test(url)) {
+                return url;
+              }
+              var clean = url.split('#')[0].split('?')[0];
+              var asset = findAsset(clean, wasAbsolute || clean.startsWith('/'));
+              return asset || String(value);
+            } catch (e) { return value; }
+          }
+
+          var origFetch = window.fetch;
+          window.fetch = function(input, init) {
+            var isRequest = typeof Request !== 'undefined' && input instanceof Request;
+            var rawUrl = isRequest ? input.url : input;
+            var resolved = resolve(rawUrl);
+            if (resolved !== rawUrl && String(resolved) !== String(rawUrl)) {
+              // Preserve method, headers, credentials, signal, and the other Request
+              // options selected by the loader while replacing only its URL.
+              if (isRequest) return origFetch(new Request(resolved, input), init);
+              return origFetch(resolved, init);
+            }
+            return origFetch(input, init);
+          };
+
+          var origOpen = XMLHttpRequest.prototype.open;
+          XMLHttpRequest.prototype.open = function(method, url) {
+            var args = Array.prototype.slice.call(arguments);
+            args[1] = resolve(url);
+            return origOpen.apply(this, args);
+          };
+})();
+<\/script>`;
             }
 
             function cleanupBlobs() {
@@ -2410,10 +2517,12 @@
                     return resolved ? `${prefix}${quote}${resolved}${quote}` : match;
                 });
 
-                // Inject the debug-forwarding shim and the GPU/toggle settings shim as
-                // early as possible so both are active before the game's own (compiled)
-                // scripts run.
-                const injectedShims = debugShim + buildSettingsShim(settings.gpu, settings.toggles);
+                // Inject request redirection before the compiled module starts. Runtime
+                // loaders (notably three.js GLTFLoader) fetch model URLs rather than
+                // importing them, including files placed in Vite's public/ directory.
+                const entryHtmlDir = entryHtmlPath.includes('/') ? entryHtmlPath.slice(0, entryHtmlPath.lastIndexOf('/') + 1) : '';
+                const injectedShims = buildAssetResolverShim(publicMap, entryHtmlDir) +
+                    debugShim + buildSettingsShim(settings.gpu, settings.toggles);
                 if (/<head[^>]*>/i.test(finalHtml)) {
                     finalHtml = finalHtml.replace(/<head[^>]*>/i, m => m + injectedShims);
                 } else {
@@ -2756,67 +2865,8 @@
                     const assetMapForShim = {};
                     Object.keys(blobUrlMap).forEach(p => { assetMapForShim[p] = blobUrlMap[p]; });
 
-                    const shim = `
-<script>
-(function(){
-          var ASSETS = ${JSON.stringify(assetMapForShim)};
-          var BASE_DIR = ${JSON.stringify(entryDir)};
-          function resolve(url) {
-            try {
-              if (typeof url !== 'string') return url;
-              if (url.startsWith('data:') || url.startsWith('blob:')) return url;
-              // Some libraries (e.g. three.js's GLTFLoader/LoaderUtils) resolve a
-              // relative path against document.baseURI *before* calling fetch, so by
-              // the time we see it here it's already an absolute URL pointing at this
-              // runner's own origin (since srcdoc iframes inherit the parent's
-              // baseURI). Unwrap same-origin absolute URLs back into a plain path so
-              // they can still be matched against ASSETS below, instead of letting
-              // them fall through to the real network (which 404s / returns HTML).
-              if (/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) {
-                try {
-                  var u = new URL(url);
-                  if (u.origin === location.origin) {
-                    url = u.pathname + u.search + u.hash;
-                  } else {
-                    return url; // genuinely cross-origin (e.g. unpkg.com) -- leave alone
-                  }
-                } catch (e) { return url; }
-              } else if (/^\/\//.test(url)) {
-                return url; // protocol-relative cross-origin URL
-              }
-              var clean = url.split('#')[0].split('?')[0];
-              var wasRootAbsolute = clean.startsWith('/');
-              if (wasRootAbsolute) clean = clean.slice(1);
-              clean = clean.replace(/^\\.\\//, '');
-              var bases = wasRootAbsolute ? ['', BASE_DIR] : [BASE_DIR];
-              for (var b=0;b<bases.length;b++){
-                var parts = (bases[b] + clean).split('/');
-                var stack = [];
-                for (var i=0;i<parts.length;i++){
-                  var part = parts[i];
-                  if (part === '..') stack.pop();
-                  else if (part === '.' || part === '') continue;
-                  else stack.push(part);
-                }
-                var finalPath = stack.join('/');
-                if (ASSETS[finalPath]) return ASSETS[finalPath];
-              }
-              return url;
-            } catch(e) { return url; }
-          }
-          var origFetch = window.fetch;
-          window.fetch = function(input, init) {
-            if (typeof input === 'string') return origFetch(resolve(input), init);
-            return origFetch(input, init);
-          };
-          var origOpen = XMLHttpRequest.prototype.open;
-          XMLHttpRequest.prototype.open = function(method, url) {
-            var args = Array.prototype.slice.call(arguments);
-            args[1] = resolve(url);
-            return origOpen.apply(this, args);
-          };
-})();
-<\/script>${debugShim}${buildSettingsShim(settings.gpu, settings.toggles)}`;
+                    const shim = buildAssetResolverShim(assetMapForShim, entryDir) +
+                        debugShim + buildSettingsShim(settings.gpu, settings.toggles);
 
                     if (/<head[^>]*>/i.test(html)) {
                         html = html.replace(/<head[^>]*>/i, m => m + shim);

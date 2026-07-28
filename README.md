@@ -18,7 +18,7 @@ Games are saved to a local library (via IndexedDB) so you can reload them later 
 - **Zip-only input.** Only `.zip` files are accepted (both by file picker and drag-and-drop). `.tar.gz` / other archive formats are **not** supported.
 - **Static HTML/JS games** — the common case: an `index.html` plus JS/CSS/assets, run as-is.
 - **React / Vite / TypeScript source projects** are also supported and tested — including React + Three.js projects. If the runner detects a source project (e.g. bare imports like `import React from "react"`, or `.ts`/`.tsx`/`.jsx` entry files), it bundles it in-browser using `esbuild-wasm` before running it, resolving both relative imports and bare package imports (pulled from a CDN). If bundling fails, it falls back to trying the zip as a static file set.
-- **Asset support**: images, JSON, CSS, and audio/video formats including `.mp3`, `.wav`, `.ogg`, `.mp4`, `.webm`, `.webp`, `.gif`, `.svg` are recognized and mapped to the correct MIME type when converted to data URIs.
+- **Asset support**: images, JSON, CSS, standalone glTF models (`.glb`, `.gltf`, and related `.bin`/texture files), and audio/video formats including `.mp3`, `.wav`, `.ogg`, `.mp4`, `.webm`, `.webp`, `.gif`, `.svg` are recognized and mapped to data URIs. Runtime `fetch()`/XHR requests—including the `Request` objects used by Three.js loaders—are redirected to the corresponding file from the zip.
 - **Resolution control**: choose "fit to window" or a fixed internal resolution (independent of how large the game appears on screen) up to 7680×4320.
 - **GPU / WebGL settings**: power preference, antialiasing, canvas alpha, preserve drawing buffer, and fail-on-low-perf-caveat — applied automatically to `getContext('webgl'/'webgl2')` calls inside the game.
 - **Toggles**: mute audio, show FPS overlay, pixelated (nearest-neighbor) canvas scaling, and disable pause-on-blur.
@@ -30,7 +30,7 @@ Games are saved to a local library (via IndexedDB) so you can reload them later 
 ## What's untested / uncertain
 
 - **WebAssembly (`.wasm`)** — not tested. May or may not work depending on how the game loads it.
-- **`.glb` / 3D model files** — only confirmed to work if base64-encoded directly into another file (e.g. inlined in JS/JSON) rather than referenced as a separate file in the zip. Loading a standalone `.glb` file from the zip is untested.
+- **Compressed glTF models** — ordinary standalone `.glb`/`.gltf` files are mapped from the zip, but models using Draco, Meshopt, or KTX2/Basis compression still depend on the game configuring the corresponding browser decoder. Decoder files must either be available in the zip or reachable over the network.
 - Other frameworks with a similar Vite-based/source-project setup may work through the same esbuild path (React + Vite + Three.js is confirmed working), but this hasn't been broadly verified beyond that.
 
 ## Limitations
