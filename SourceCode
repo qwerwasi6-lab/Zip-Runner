@@ -1960,13 +1960,17 @@
           }
 
           // fetch/XHR do not see URLs assigned directly to DOM elements. Redirect common
-          // media element properties as well, including img.src used by game preloaders.
-          [window.HTMLImageElement, window.HTMLScriptElement, window.HTMLSourceElement, window.HTMLMediaElement].forEach(function(Ctor) {
+          // media and stylesheet properties as well, including img.src and link.href used
+          // by framework preloaders and runtime CSS injection.
+          [[window.HTMLImageElement, 'src'], [window.HTMLScriptElement, 'src'],
+           [window.HTMLSourceElement, 'src'], [window.HTMLMediaElement, 'src'],
+           [window.HTMLMediaElement, 'poster'], [window.HTMLLinkElement, 'href']].forEach(function(item) {
+            var Ctor = item[0], property = item[1];
             if (!Ctor) return;
-            var descriptor = Object.getOwnPropertyDescriptor(Ctor.prototype, 'src');
+            var descriptor = Object.getOwnPropertyDescriptor(Ctor.prototype, property);
             if (!descriptor || !descriptor.set || !descriptor.get) return;
             try {
-              Object.defineProperty(Ctor.prototype, 'src', {
+              Object.defineProperty(Ctor.prototype, property, {
                 configurable: descriptor.configurable,
                 enumerable: descriptor.enumerable,
                 get: descriptor.get,
@@ -2793,31 +2797,32 @@
                         });
                     }
 
-                    // Rewrite src="" and href="" for local files we have in the map,
-                    // and for linked stylesheets, fetch + rewrite their internal url()s too.
-                    const cssRewritePromises = [];
-                    html = html.replace(/(<link\b[^>]*?\srel\s*=\s*["']stylesheet["'][^>]*?\shref\s*=\s*["'])(.*?)(["'][^>]*>)/gi, (match, prefix, val, suffix) => {
+                    // Rewrite linked stylesheets regardless of whether href appears before
+                    // or after rel. The previous order-dependent expression silently skipped
+                    // common Vite/React output such as <link href="..." rel="stylesheet">,
+                    // leaving the app functional but rendered with browser-default controls.
+                    html = html.replace(/<link\b[^>]*>/gi, linkTag => {
+                        const relMatch = linkTag.match(/\srel\s*=\s*(["'])(.*?)\1/i);
+                        const hrefMatch = linkTag.match(/\shref\s*=\s*(["'])(.*?)\1/i);
+                        if (!relMatch || !/(^|\s)stylesheet(\s|$)/i.test(relMatch[2]) || !hrefMatch) return linkTag;
+                        const val = hrefMatch[2];
                         const resolved = resolveLocal(val);
-                        if (!resolved) return match;
-                        const placeholder = `__CSS_PLACEHOLDER_${cssRewritePromises.length}__`;
-                        cssRewritePromises.push((async () => {
-                            try {
-                                const cssDir = val.includes('/')
-                                    ? (val.startsWith('/') ? val.slice(1, val.lastIndexOf('/') + 1) : entryDir + val.slice(0, val.lastIndexOf('/') + 1))
-                                    : entryDir;
-                                const cssText = dataUriToText(resolved);
-                                const rewritten = rewriteCssUrls(cssText, cssDir);
-                                return `data:text/css;base64,${utf8ToBase64(rewritten)}`;
-                            } catch (e) {
-                                return resolved; // fall back to unrewritten stylesheet
-                            }
-                        })());
-                        return `${prefix}${placeholder}${suffix}`;
-                    });
-
-                    const cssResolved = await Promise.all(cssRewritePromises);
-                    cssResolved.forEach((url, i) => {
-                        html = html.replace(`__CSS_PLACEHOLDER_${i}__`, url);
+                        if (!resolved) return linkTag;
+                        let finalCssUrl = resolved;
+                        try {
+                            let cssPath = val;
+                            if (/^[a-z][a-z0-9+.-]*:\/\//i.test(cssPath)) cssPath = new URL(cssPath).pathname;
+                            cssPath = cssPath.split('#')[0].split('?')[0];
+                            const wasRootAbsolute = cssPath.startsWith('/');
+                            cssPath = cssPath.replace(/^\/+/, '');
+                            const cssDir = cssPath.includes('/')
+                                ? (wasRootAbsolute ? entryDir + cssPath.slice(0, cssPath.lastIndexOf('/') + 1) : entryDir + cssPath.slice(0, cssPath.lastIndexOf('/') + 1))
+                                : entryDir;
+                            const cssText = dataUriToText(resolved);
+                            const rewritten = rewriteCssUrls(cssText, cssDir);
+                            finalCssUrl = `data:text/css;base64,${utf8ToBase64(rewritten)}`;
+                        } catch (e) { /* use the original mapped stylesheet */ }
+                        return linkTag.replace(hrefMatch[0], hrefMatch[0].replace(val, finalCssUrl));
                     });
 
                     // Rewrite inline <style> blocks' url() references too
@@ -3045,7 +3050,16 @@
                     // Build an asset resolver map (relative to entryDir) for a runtime fetch/XHR shim,
                     // so scripts that fetch() JSON/images by relative path still work.
                     const assetMapForShim = {};
-                    Object.keys(blobUrlMap).forEach(p => { assetMapForShim[p] = blobUrlMap[p]; });
+                    Object.keys(blobUrlMap).forEach(p => {
+                        let mapped = blobUrlMap[p];
+                        if (/\.css$/i.test(p)) {
+                            try {
+                                const cssDir = p.includes('/') ? p.slice(0, p.lastIndexOf('/') + 1) : '';
+                                mapped = `data:text/css;base64,${utf8ToBase64(rewriteCssUrls(dataUriToText(mapped), cssDir))}`;
+                            } catch (e) { /* retain original stylesheet */ }
+                        }
+                        assetMapForShim[p] = mapped;
+                    });
 
                     const shim = generatedImportMapTag + buildAssetResolverShim(assetMapForShim, entryDir) +
                         debugShim + buildSettingsShim(settings.gpu, settings.toggles);
