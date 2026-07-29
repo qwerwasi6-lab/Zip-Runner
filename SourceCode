@@ -1935,7 +1935,12 @@
               var wasAbsolute = /^[a-z][a-z0-9+.-]*:\\/\\//i.test(url);
               if (wasAbsolute) {
                 var parsed = new URL(url);
-                if (parsed.origin !== location.origin) return url;
+                // Development builds frequently leave Vite/localhost asset URLs in
+                // otherwise portable output. Treat loopback hosts as the game's virtual
+                // zip origin instead of attempting a network request to a dead dev server.
+                var isLoopback = parsed.hostname === 'localhost' || parsed.hostname === '::1' ||
+                  parsed.hostname === '[::1]' || /^127(?:\\.\\d+){3}$/.test(parsed.hostname);
+                if (parsed.origin !== location.origin && !isLoopback) return url;
                 url = parsed.pathname + parsed.search + parsed.hash;
               } else if (/^\\/\\//.test(url)) {
                 return url;
@@ -1953,6 +1958,28 @@
               return String(value);
             } catch (e) { return value; }
           }
+
+          // fetch/XHR do not see URLs assigned directly to DOM elements. Redirect common
+          // media element properties as well, including img.src used by game preloaders.
+          [window.HTMLImageElement, window.HTMLScriptElement, window.HTMLSourceElement, window.HTMLMediaElement].forEach(function(Ctor) {
+            if (!Ctor) return;
+            var descriptor = Object.getOwnPropertyDescriptor(Ctor.prototype, 'src');
+            if (!descriptor || !descriptor.set || !descriptor.get) return;
+            try {
+              Object.defineProperty(Ctor.prototype, 'src', {
+                configurable: descriptor.configurable,
+                enumerable: descriptor.enumerable,
+                get: descriptor.get,
+                set: function(value) { descriptor.set.call(this, resolve(value)); }
+              });
+            } catch (e) { /* browser does not permit patching this element */ }
+          });
+          var origSetAttribute = Element.prototype.setAttribute;
+          Element.prototype.setAttribute = function(name, value) {
+            var lower = String(name).toLowerCase();
+            if (lower === 'src' || lower === 'href' || lower === 'poster') value = resolve(value);
+            return origSetAttribute.call(this, name, value);
+          };
 
           var origFetch = window.fetch;
           window.fetch = function(input, init) {
@@ -2462,6 +2489,35 @@
                     else jsOutput += out.text;
                 }
 
+                // Map Vite public/ files both by their physical archive path and by their
+                // browser-facing root path. Also repair hard-coded localhost asset URLs
+                // left in compiled output, which otherwise try to contact the old dev server.
+                const publicMap = {};
+                Object.keys(binaryBlobUrls).forEach(p => {
+                    publicMap[p] = binaryBlobUrls[p];
+                    publicMap[p.replace(/^public\//, '')] = binaryBlobUrls[p];
+                });
+                function resolveProjectDevAsset(rawUrl) {
+                    try {
+                        const parsed = new URL(rawUrl);
+                        const isLoopback = parsed.hostname === 'localhost' || parsed.hostname === '::1' ||
+                            parsed.hostname === '[::1]' || /^127(?:\.\d+){3}$/.test(parsed.hostname);
+                        if (!isLoopback) return null;
+                        const clean = decodeURIComponent(parsed.pathname).replace(/^\/+/, '');
+                        return publicMap[clean] || publicMap['public/' + clean] || null;
+                    } catch (e) { return null; }
+                }
+                jsOutput = jsOutput.replace(/(["'])(https?:\/\/(?:localhost|127(?:\.\d+){3}|\[?::1\]?)(?::\d+)?\/[^"']*)\1/gi,
+                    (match, quote, url) => {
+                        const resolved = resolveProjectDevAsset(url);
+                        return resolved ? `${quote}${resolved}${quote}` : match;
+                    });
+                cssOutput = cssOutput.replace(/url\(\s*(["']?)(https?:\/\/(?:localhost|127(?:\.\d+){3}|\[?::1\]?)(?::\d+)?\/[^"')]+)\1\s*\)/gi,
+                    (match, quote, url) => {
+                        const resolved = resolveProjectDevAsset(url);
+                        return resolved ? `url(${quote}${resolved}${quote})` : match;
+                    });
+
                 // ---- Tailwind detection ----
                 // If the project uses Tailwind (v4 "@import tailwindcss" or v3 "@tailwind" directives),
                 // we can't run Tailwind's Node-based build in-browser easily. Instead we ship the
@@ -2539,12 +2595,18 @@
                 );
 
                 // Resolve any remaining static asset references in the HTML itself (e.g. <link rel="icon">, images in public/)
-                const publicMap = {};
-                Object.keys(binaryBlobUrls).forEach(p => { publicMap[p.replace(/^public\//, '')] = binaryBlobUrls[p]; publicMap[p] = binaryBlobUrls[p]; });
                 finalHtml = finalHtml.replace(/(\s(?:src|href)\s*=\s*)(["'])(.*?)\2/gi, (match, prefix, quote, val) => {
-                    if (/^([a-z][a-z0-9+.-]*:)?\/\//i.test(val) || val.startsWith('data:') || val.startsWith('blob:') || val.startsWith('#')) return match;
-                    const clean = val.replace(/^\.?\//, '');
-                    const resolved = publicMap[clean];
+                    if (val.startsWith('data:') || val.startsWith('blob:') || val.startsWith('#')) return match;
+                    let resolved = null;
+                    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(val)) {
+                        resolved = resolveProjectDevAsset(val);
+                        if (!resolved) return match;
+                    } else if (/^\/\//.test(val)) {
+                        return match;
+                    } else {
+                        const clean = val.replace(/^\.?\//, '');
+                        resolved = publicMap[clean];
+                    }
                     return resolved ? `${prefix}${quote}${resolved}${quote}` : match;
                 });
 
@@ -2673,7 +2735,21 @@
                     // reference, walks '..'/'.' segments, and looks the result up in the
                     // flat blobUrlMap. Works for any nesting depth.
                     function resolveFrom(baseDir, relPath) {
-                        if (/^([a-z][a-z0-9+.-]*:)?\/\//i.test(relPath) || relPath.startsWith('data:') || relPath.startsWith('blob:') || relPath.startsWith('#')) {
+                        if (relPath.startsWith('data:') || relPath.startsWith('blob:') || relPath.startsWith('#')) return null;
+
+                        // Production zips sometimes retain hard-coded dev-server URLs
+                        // such as http://localhost:3001/images/menu-card.jpg. Resolve
+                        // loopback URLs against the archive's virtual web root. Real
+                        // remote URLs remain remote and are never replaced.
+                        if (/^[a-z][a-z0-9+.-]*:\/\//i.test(relPath)) {
+                            try {
+                                const parsed = new URL(relPath);
+                                const isLoopback = parsed.hostname === 'localhost' || parsed.hostname === '::1' ||
+                                    parsed.hostname === '[::1]' || /^127(?:\.\d+){3}$/.test(parsed.hostname);
+                                if (!isLoopback) return null;
+                                relPath = parsed.pathname + parsed.search + parsed.hash;
+                            } catch (e) { return null; }
+                        } else if (/^\/\//.test(relPath)) {
                             return null;
                         }
                         let clean = relPath.split('#')[0].split('?')[0];
@@ -2840,6 +2916,22 @@
                             const dataUri = blobUrlMap[resolvedPath];
                             return dataUri ? `${quote}${dataUri}${quote}` : match;
                         });
+
+                        // Rewrite hard-coded localhost asset strings too. Unlike fetch/XHR,
+                        // element assignments such as img.src cannot be intercepted by the
+                        // runtime request shim, so they must be fixed in source beforehand.
+                        rewritten = rewritten.replace(/(["'])(https?:\/\/(?:localhost|127(?:\.\d+){3}|\[?::1\]?)(?::\d+)?\/[^"']*)\1/gi,
+                            (match, quote, spec) => {
+                                let localPath;
+                                try {
+                                    const parsed = new URL(spec);
+                                    localPath = parsed.pathname + parsed.search + parsed.hash;
+                                } catch (e) { return match; }
+                                const resolvedPath = resolveModuleSpecifierPath(jsDir, localPath);
+                                const dataUri = resolvedPath && blobUrlMap[resolvedPath];
+                                return dataUri ? `${quote}${dataUri}${quote}` : match;
+                            }
+                        );
 
                         return rewritten;
                     }
